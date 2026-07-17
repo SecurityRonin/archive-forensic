@@ -1,0 +1,7 @@
+# Allow `unwrap()`/`expect()` inside tests; production code keeps them denied
+# (workspace Cargo.toml). Tests legitimately unwrap to fail loudly.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# ZIP/format names that look like code identifiers to doc_markdown.
+doc-valid-idents = ["EOCD", "LFH", "Zip64", "CP437", "CRC-32", "Deflate64", "LZMA", "XZ", "Zstd", "bzip2", "zip-rs", "miniz_oxide", "Zip-Slip", "WinZip", "WinRAR", "ZipCrypto", "PBKDF2", "HMAC-SHA1", "AES-CTR", "RustCrypto", "WavPack", "PPMd", "DCL", "..", "SHA-256", "MD5"]

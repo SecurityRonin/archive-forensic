@@ -1,0 +1,4 @@
+# gitleaks configuration — extends the default ruleset. No project-specific
+# secrets or cache keys are committed; the default rules apply unchanged.
+[extend]
+useDefault = true

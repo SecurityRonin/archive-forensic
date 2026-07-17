@@ -1,0 +1,25 @@
+//! `archive_core` — a pure-Rust, `forbid(unsafe)`, read-only **archive-detour**
+//! reader for forensics.
+//!
+//! An archive is treated as a transparent *outer packing layer*: `foo.E01.gz`
+//! resolves identically to `foo.E01`. [`peel_bytes`] removes one packing layer
+//! when present, so a consumer can recurse until it reaches the real evidence.
+//!
+//! Format determination follows the settled model: the **content magic** is the
+//! authority for the compression codec actually applied (you cannot gzip-decode
+//! bzip2 bytes), while the **file name** is a secondary hint used for aliases
+//! (`.tgz`→gzip+tar) and the magic-absent formats. See [`sniff`].
+//!
+//! Codec coverage grows incrementally; gzip is wired first (the canonical
+//! `E01.gz` detour). Large-member streaming / temp-spill (for multi-GB inner
+//! evidence) is the next hardening step — today the peel is in-memory with a
+//! hard output cap.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod detect;
+mod error;
+mod peel;
+
+pub use detect::{sniff, Format};
+pub use error::{ArchiveError, Result};
+pub use peel::{peel_bytes, PeelOutcome};

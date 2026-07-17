@@ -1,0 +1,24 @@
+[package]
+name = "archive-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Pure-Rust archive-detour reader for forensics: transparently peels gzip/bzip2/xz/zip/7z/tar packing layers to reveal the inner evidence, with extension-and-magic format detection."
+readme = "../README.md"
+keywords = ["archive", "gzip", "forensics", "dfir", "decompress"]
+categories = ["compression", "filesystem", "parser-implementations"]
+
+[lib]
+name = "archive_core"
+
+[dependencies]
+thiserror.workspace = true
+# Pure-Rust gzip/deflate (miniz_oxide backend — no C). More codecs (bzip2-rs,
+# lzma-rs, zip-forensic-core, sevenzip-core, tar) land as peel support grows.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "archive-forensic"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Forensic anomaly auditor for archives — extension-vs-content masquerade, CRC/declared-size lies, path-traversal member names, decompression-bomb signatures — over archive-core."
+readme = "../README.md"
+keywords = ["archive", "forensics", "dfir", "anomaly", "masquerade"]
+categories = ["filesystem", "parser-implementations"]
+
+[dependencies]
+archive-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
