@@ -78,6 +78,36 @@ mod tests {
         }
     }
 
+    const PAYLOAD_BZ2: &[u8] = include_bytes!("../../tests/data/fixtures/payload.bz2");
+
+    #[test]
+    fn peels_bzip2() {
+        let expected = "archive-detour bzip2 test payload — the quick brown fox\n"
+            .repeat(30)
+            .into_bytes();
+        match peel_bytes(PAYLOAD_BZ2, Some("payload.bz2")).unwrap() {
+            PeelOutcome::Peeled { format, inner } => {
+                assert_eq!(format, Format::Bzip2);
+                assert_eq!(inner, expected);
+            }
+            other => panic!("expected Peeled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peels_xz() {
+        let inner = b"xz detour payload \x00\x01 the quick brown fox".repeat(15);
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut &inner[..], &mut xz).unwrap();
+        match peel_bytes(&xz, Some("payload.xz")).unwrap() {
+            PeelOutcome::Peeled { format, inner: got } => {
+                assert_eq!(format, Format::Xz);
+                assert_eq!(got, inner);
+            }
+            other => panic!("expected Peeled, got {other:?}"),
+        }
+    }
+
     #[test]
     fn non_packed_passthrough() {
         let raw = b"\x00\x01\x02 not a known wrapper";
