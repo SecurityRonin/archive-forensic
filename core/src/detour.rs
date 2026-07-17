@@ -88,17 +88,19 @@ fn cap(inner: Vec<u8>, limits: &Limits) -> Result<Detour> {
     Ok(Detour::Inner(inner))
 }
 
-/// Does the file name carry a compression-wrapper extension (incl. tar aliases)?
-/// This is the coincidental-magic guard for the bare-wrapper branch, kept here
-/// as the single fleet copy the image-opening consumers share.
+/// Does the file name carry a supported packed extension? This is the
+/// coincidental-magic guard for the bare-wrapper branch — a raw disk that starts
+/// with `1F 8B`/`BZh` magic but lacks a compression extension must open as raw.
+/// The list is the actually-supported trimmed format set (magic is definitive
+/// for the archive members, so only the bare `.gz`/`.bz2` case is load-bearing).
+/// Kept here as the single fleet copy the image-opening consumers share.
 fn has_compression_ext(name: Option<&str>) -> bool {
     let Some(name) = name else {
         return false;
     };
     let lower = name.to_ascii_lowercase();
     [
-        ".gz", ".bz2", ".xz", ".tgz", ".taz", ".tbz", ".tbz2", ".txz", ".tzst", ".tlz", ".zst",
-        ".z",
+        ".gz", ".bz2", ".tgz", ".tar.gz", ".tbz2", ".tar.bz2", ".zip", ".clbx", ".7z",
     ]
     .iter()
     .any(|e| lower.ends_with(e))
