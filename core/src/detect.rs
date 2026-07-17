@@ -1,96 +1,95 @@
-//! Format determination: content magic is the authority for the compression
-//! codec; the file name is a secondary hint (aliases + the magic-absent
-//! formats).
+//! Format determination: content magic decides the codec / container; the file
+//! name is a secondary hint for the tar-compression aliases (`.tgz`→gzip+tar,
+//! `.tbz2`→bzip2+tar) and the magic-absent cases.
 
-/// A recognized outer packing format.
+/// A recognized packing format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Format {
-    // Compression wrappers (1 → 1: peel to a single inner stream).
+    /// Bare gzip stream (a single compressed file, e.g. `disk.dd.gz`).
     Gzip,
+    /// Bare bzip2 stream (a single compressed file, e.g. `disk.dd.bz2`).
     Bzip2,
-    Xz,
-    Zstd,
-    Compress,
-    // Containers (member lists).
+    /// tar compressed with gzip (`.tgz` / `.tar.gz`) — a member list.
+    TarGz,
+    /// tar compressed with bzip2 (`.tbz2` / `.tar.bz2`) — a member list.
+    TarBz2,
+    /// ZIP archive — a member list.
     Zip,
+    /// 7-Zip archive — a member list.
     SevenZip,
-    Tar,
     /// Not a recognized packing layer.
     Unknown,
 }
 
 impl Format {
-    /// A 1→1 compression wrapper that peels to a single inner byte stream.
+    /// A 1→1 bare compression wrapper that peels to a single inner byte stream.
     #[must_use]
     pub fn is_compression_wrapper(self) -> bool {
+        matches!(self, Format::Gzip | Format::Bzip2)
+    }
+
+    /// A multi-member archive (tar.gz / tar.bz2 / zip / 7z).
+    #[must_use]
+    pub fn is_archive(self) -> bool {
         matches!(
             self,
-            Format::Gzip | Format::Bzip2 | Format::Xz | Format::Zstd | Format::Compress
+            Format::TarGz | Format::TarBz2 | Format::Zip | Format::SevenZip
         )
     }
 }
 
-/// Determine the outer packing format. Content **magic** decides the codec
-/// (definitive for compression wrappers + 7z); the file **name** is consulted
-/// only for aliases and the magic-absent formats (POSIX tar has a magic; old
-/// v7 tar and self-extracting zip do not — those lean on the name).
+/// Determine the packing format. Container identity (zip / 7z) is decided by
+/// **magic**; the tar-compression combos (`.tgz`/`.tbz2`) are distinguished from
+/// bare gzip/bzip2 by the file **name** (the outer magic alone can't tell a
+/// gzipped tar from a gzipped single file).
 #[must_use]
 pub fn sniff(name: Option<&str>, head: &[u8]) -> Format {
-    if head.starts_with(&[0x1F, 0x8B]) {
-        return Format::Gzip;
-    }
-    if head.starts_with(b"BZh") {
-        return Format::Bzip2;
-    }
-    if head.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
-        return Format::Xz;
-    }
-    if head.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
-        return Format::Zstd;
-    }
-    if head.starts_with(&[0x1F, 0x9D]) {
-        return Format::Compress;
-    }
+    // Containers with a definitive magic.
     if head.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) {
         return Format::SevenZip;
     }
     if head.starts_with(b"PK\x03\x04") {
         return Format::Zip;
     }
-    // POSIX/ustar tar: magic at offset 257.
-    if head.len() >= 262 && &head[257..262] == b"ustar" {
-        return Format::Tar;
+    // Compression codecs: the name decides tar-inside vs bare single file.
+    let lower = name.map(str::to_ascii_lowercase);
+    let ends = |suf: &str| lower.as_deref().is_some_and(|n| n.ends_with(suf));
+    if head.starts_with(&[0x1F, 0x8B]) {
+        return if ends(".tgz") || ends(".tar.gz") {
+            Format::TarGz
+        } else {
+            Format::Gzip
+        };
     }
-    // Magic silent → fall to the name (aliases + v7-tar / SFX-zip).
-    name.and_then(format_from_extension)
-        .unwrap_or(Format::Unknown)
-}
-
-/// Map a file name's (compound) extension to a format. Alias-aware:
-/// `.tgz`/`.taz`→gzip, `.tbz`/`.tbz2`→bzip2, `.txz`→xz, `.tzst`→zstd,
-/// `.tlz`→xz/lzma — each also implying a tar inside.
-fn format_from_extension(name: &str) -> Option<Format> {
-    let lower = name.to_ascii_lowercase();
-    let table = [
-        (".tgz", Format::Gzip),
-        (".taz", Format::Gzip),
-        (".tbz2", Format::Bzip2),
-        (".tbz", Format::Bzip2),
-        (".txz", Format::Xz),
-        (".tzst", Format::Zstd),
-        (".tlz", Format::Xz),
-        (".gz", Format::Gzip),
-        (".bz2", Format::Bzip2),
-        (".xz", Format::Xz),
-        (".zst", Format::Zstd),
-        (".z", Format::Compress),
-        (".7z", Format::SevenZip),
-        (".zip", Format::Zip),
-        (".tar", Format::Tar),
-    ];
-    table
-        .into_iter()
-        .find(|(suf, _)| lower.ends_with(suf))
-        .map(|(_, f)| f)
+    if head.starts_with(b"BZh") {
+        return if ends(".tbz2") || ends(".tar.bz2") {
+            Format::TarBz2
+        } else {
+            Format::Bzip2
+        };
+    }
+    // Magic silent → fall to the name (renamed / stripped-header cases).
+    if ends(".7z") {
+        return Format::SevenZip;
+    }
+    // `.clbx` is Cellebrite's extraction container — an ordinary ZIP (per the
+    // published cellebrite-labs/clbx spec: files + msgpack metadata inside a ZIP).
+    // Its CLBX-specific semantics are a higher layer; here it's read as a ZIP.
+    if ends(".zip") || ends(".clbx") {
+        return Format::Zip;
+    }
+    if ends(".tgz") || ends(".tar.gz") {
+        return Format::TarGz;
+    }
+    if ends(".tbz2") || ends(".tar.bz2") {
+        return Format::TarBz2;
+    }
+    if ends(".gz") {
+        return Format::Gzip;
+    }
+    if ends(".bz2") {
+        return Format::Bzip2;
+    }
+    Format::Unknown
 }

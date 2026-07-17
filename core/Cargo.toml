@@ -16,11 +16,9 @@ name = "archive_core"
 
 [dependencies]
 thiserror.workspace = true
-# Pure-Rust compression decoders (no C). Container peels (zip-forensic-core,
-# sevenzip-core, tar) land as support grows.
+# Pure-Rust compression decoders (no C) for the tar.gz / tar.bz2 outer layer.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 bzip2-rs = "0.1"
-lzma-rs = "0.3"
 
 [lints]
 workspace = true

@@ -1,25 +1,31 @@
-//! Peel one outer packing layer, if present.
+//! Peel one outer BARE compression layer (gzip / bzip2), if present.
+//!
+//! This handles a single compressed file — e.g. a `disk.dd.gz` evidence image.
+//! Multi-member archives (`.tgz`/`.tbz2`/`.zip`/`.7z`) are handled by
+//! [`crate::archive`], which reuses [`decode_gzip`]/[`decode_bzip2`] for their
+//! outer layer.
 
 use crate::detect::{sniff, Format};
 use crate::error::{ArchiveError, Result};
 
-/// In-memory cap on a single peel's decompressed output (bomb guard). Streaming
-/// / temp-spill for genuinely large inner evidence is the next hardening step.
-const MAX_INFLATED: u64 = 4 << 30; // 4 GiB
+/// In-memory cap on a single decompression's output (bomb guard). Streaming /
+/// temp-spill for genuinely large inner evidence is the next hardening step.
+pub(crate) const MAX_INFLATED: u64 = 4 << 30; // 4 GiB
 
-/// The result of attempting to peel one packing layer.
+/// The result of attempting to peel one bare-compression layer.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PeelOutcome {
-    /// The input is not a recognized packing layer — pass it through unchanged.
+    /// Not a bare compression wrapper — pass it through unchanged.
     NotPacked,
-    /// A compression wrapper was peeled to its inner byte stream. A consumer
+    /// A bare gzip/bzip2 wrapper peeled to its inner byte stream. A consumer
     /// re-runs detection on `inner` to continue down the stack.
     Peeled { format: Format, inner: Vec<u8> },
 }
 
-/// Peel one outer compression layer from `data` if it is a recognized wrapper.
-/// `name` is an optional file name used as a secondary detection hint.
+/// Peel one outer BARE gzip/bzip2 compression layer from `data`. Archives
+/// (`.tgz`/`.tbz2`/`.zip`/`.7z`) are NOT peeled here — they are member lists;
+/// use [`crate::archive::open`]. `name` is an optional file-name hint.
 pub fn peel_bytes(data: &[u8], name: Option<&str>) -> Result<PeelOutcome> {
     match sniff(name, data) {
         Format::Gzip => Ok(PeelOutcome::Peeled {
@@ -30,77 +36,12 @@ pub fn peel_bytes(data: &[u8], name: Option<&str>) -> Result<PeelOutcome> {
             format: Format::Bzip2,
             inner: decode_bzip2(data)?,
         }),
-        Format::Xz => Ok(PeelOutcome::Peeled {
-            format: Format::Xz,
-            inner: decode_xz(data)?,
-        }),
         _ => Ok(PeelOutcome::NotPacked),
     }
 }
 
-/// Inflate a bzip2 stream to bytes, failing loud past [`MAX_INFLATED`].
-fn decode_bzip2(data: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let mut out = Vec::new();
-    let mut limited = bzip2_rs::DecoderReader::new(data).take(MAX_INFLATED + 1);
-    limited
-        .read_to_end(&mut out)
-        .map_err(|e| ArchiveError::Decode {
-            format: "bzip2",
-            detail: e.to_string(),
-        })?;
-    if out.len() as u64 > MAX_INFLATED {
-        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
-    }
-    Ok(out)
-}
-
-/// Decode an xz stream to bytes, capping output mid-decode (bomb guard).
-fn decode_xz(data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = CappedWrite::new(MAX_INFLATED);
-    let mut input = data;
-    lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| ArchiveError::Decode {
-        format: "xz",
-        detail: e.to_string(),
-    })?;
-    Ok(out.into_inner())
-}
-
-/// A `Write` that fails loud once total output would exceed `cap`.
-struct CappedWrite {
-    buf: Vec<u8>,
-    cap: u64,
-}
-
-impl CappedWrite {
-    fn new(cap: u64) -> Self {
-        Self {
-            buf: Vec::new(),
-            cap,
-        }
-    }
-    fn into_inner(self) -> Vec<u8> {
-        self.buf
-    }
-}
-
-impl std::io::Write for CappedWrite {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        if self.buf.len() as u64 + data.len() as u64 > self.cap {
-            return Err(std::io::Error::other(
-                "decompressed output exceeds the archive-core cap",
-            ));
-        }
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Inflate a gzip member to bytes, failing loud past [`MAX_INFLATED`].
-fn decode_gzip(data: &[u8]) -> Result<Vec<u8>> {
+/// Inflate a gzip stream to bytes, failing loud past [`MAX_INFLATED`].
+pub(crate) fn decode_gzip(data: &[u8]) -> Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
     let mut out = Vec::new();
@@ -111,6 +52,23 @@ fn decode_gzip(data: &[u8]) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .map_err(|e| ArchiveError::Decode {
             format: "gzip",
+            detail: e.to_string(),
+        })?;
+    if out.len() as u64 > MAX_INFLATED {
+        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
+    }
+    Ok(out)
+}
+
+/// Inflate a bzip2 stream to bytes, failing loud past [`MAX_INFLATED`].
+pub(crate) fn decode_bzip2(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut limited = bzip2_rs::DecoderReader::new(data).take(MAX_INFLATED + 1);
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| ArchiveError::Decode {
+            format: "bzip2",
             detail: e.to_string(),
         })?;
     if out.len() as u64 > MAX_INFLATED {
@@ -133,12 +91,11 @@ mod tests {
     }
 
     #[test]
-    fn peels_gzip_to_inner_bytes() {
+    fn peels_bare_gzip_to_inner_bytes() {
         let inner = b"E01-ish evidence \x00\x01\x02 the quick brown fox".repeat(20);
         let gz = gzip(&inner);
-        // Magic wins even with a misleading name.
         assert_eq!(sniff(Some("evidence.bin"), &gz), Format::Gzip);
-        match peel_bytes(&gz, Some("evidence.E01.gz")).unwrap() {
+        match peel_bytes(&gz, Some("evidence.dd.gz")).unwrap() {
             PeelOutcome::Peeled { format, inner: got } => {
                 assert_eq!(format, Format::Gzip);
                 assert_eq!(got, inner);
@@ -150,7 +107,7 @@ mod tests {
     const PAYLOAD_BZ2: &[u8] = include_bytes!("../../tests/data/fixtures/payload.bz2");
 
     #[test]
-    fn peels_bzip2() {
+    fn peels_bare_bzip2() {
         let expected = "archive-detour bzip2 test payload — the quick brown fox\n"
             .repeat(30)
             .into_bytes();
@@ -164,17 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn peels_xz() {
-        let inner = b"xz detour payload \x00\x01 the quick brown fox".repeat(15);
-        let mut xz = Vec::new();
-        lzma_rs::xz_compress(&mut &inner[..], &mut xz).unwrap();
-        match peel_bytes(&xz, Some("payload.xz")).unwrap() {
-            PeelOutcome::Peeled { format, inner: got } => {
-                assert_eq!(format, Format::Xz);
-                assert_eq!(got, inner);
-            }
-            other => panic!("expected Peeled, got {other:?}"),
-        }
+    fn archive_is_not_bare_peeled() {
+        // A zip is a member list, not a bare wrapper — peel_bytes leaves it.
+        let zip = b"PK\x03\x04 rest of a zip";
+        assert!(matches!(
+            peel_bytes(zip, Some("eo.zip")).unwrap(),
+            PeelOutcome::NotPacked
+        ));
     }
 
     #[test]
@@ -188,8 +141,6 @@ mod tests {
 
     #[test]
     fn magic_beats_extension() {
-        // A `.gz`-named file that is actually 7z magic sniffs as 7z (content
-        // is authority for the codec).
         let seven = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 0];
         assert_eq!(sniff(Some("foo.gz"), &seven), Format::SevenZip);
     }
