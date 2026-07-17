@@ -18,12 +18,14 @@
 
 mod archive;
 mod detect;
+mod detour;
 mod error;
 mod peel;
 mod resolve;
 
 pub use archive::{Archive, ArchiveEntry};
 pub use detect::{sniff, Format};
+pub use detour::{peel_detour, Detour};
 pub use error::{ArchiveError, Result};
 pub use peel::{peel_bytes, PeelOutcome};
 pub use resolve::{resolve, Limits, Node};
