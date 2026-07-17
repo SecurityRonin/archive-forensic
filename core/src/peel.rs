@@ -26,7 +26,76 @@ pub fn peel_bytes(data: &[u8], name: Option<&str>) -> Result<PeelOutcome> {
             format: Format::Gzip,
             inner: decode_gzip(data)?,
         }),
+        Format::Bzip2 => Ok(PeelOutcome::Peeled {
+            format: Format::Bzip2,
+            inner: decode_bzip2(data)?,
+        }),
+        Format::Xz => Ok(PeelOutcome::Peeled {
+            format: Format::Xz,
+            inner: decode_xz(data)?,
+        }),
         _ => Ok(PeelOutcome::NotPacked),
+    }
+}
+
+/// Inflate a bzip2 stream to bytes, failing loud past [`MAX_INFLATED`].
+fn decode_bzip2(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut limited = bzip2_rs::DecoderReader::new(data).take(MAX_INFLATED + 1);
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| ArchiveError::Decode {
+            format: "bzip2",
+            detail: e.to_string(),
+        })?;
+    if out.len() as u64 > MAX_INFLATED {
+        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
+    }
+    Ok(out)
+}
+
+/// Decode an xz stream to bytes, capping output mid-decode (bomb guard).
+fn decode_xz(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = CappedWrite::new(MAX_INFLATED);
+    let mut input = data;
+    lzma_rs::xz_decompress(&mut input, &mut out).map_err(|e| ArchiveError::Decode {
+        format: "xz",
+        detail: e.to_string(),
+    })?;
+    Ok(out.into_inner())
+}
+
+/// A `Write` that fails loud once total output would exceed `cap`.
+struct CappedWrite {
+    buf: Vec<u8>,
+    cap: u64,
+}
+
+impl CappedWrite {
+    fn new(cap: u64) -> Self {
+        Self {
+            buf: Vec::new(),
+            cap,
+        }
+    }
+    fn into_inner(self) -> Vec<u8> {
+        self.buf
+    }
+}
+
+impl std::io::Write for CappedWrite {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() as u64 + data.len() as u64 > self.cap {
+            return Err(std::io::Error::other(
+                "decompressed output exceeds the archive-core cap",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
