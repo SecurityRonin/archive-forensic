@@ -20,8 +20,34 @@ pub enum PeelOutcome {
 
 /// Peel one outer compression layer from `data` if it is a recognized wrapper.
 /// `name` is an optional file name used as a secondary detection hint.
-pub fn peel_bytes(_data: &[u8], _name: Option<&str>) -> Result<PeelOutcome> {
-    todo!("peel one packing layer")
+pub fn peel_bytes(data: &[u8], name: Option<&str>) -> Result<PeelOutcome> {
+    match sniff(name, data) {
+        Format::Gzip => Ok(PeelOutcome::Peeled {
+            format: Format::Gzip,
+            inner: decode_gzip(data)?,
+        }),
+        _ => Ok(PeelOutcome::NotPacked),
+    }
+}
+
+/// Inflate a gzip member to bytes, failing loud past [`MAX_INFLATED`].
+fn decode_gzip(data: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    // Read one byte past the cap so an over-cap stream is *detected*, not
+    // silently truncated.
+    let mut limited = GzDecoder::new(data).take(MAX_INFLATED + 1);
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| ArchiveError::Decode {
+            format: "gzip",
+            detail: e.to_string(),
+        })?;
+    if out.len() as u64 > MAX_INFLATED {
+        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
