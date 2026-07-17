@@ -44,6 +44,11 @@ zip -q -X nested.tbz.zip foo.tbz
 # double compression wrapper for resolve (.gz.gz -> leaf)
 printf 'double gzipped leaf payload\n' > leaf.txt
 gzip -n -c leaf.txt | gzip -n -c > leaf.txt.gz.gz
+
+# single-member archive for the peel_detour single-image case
+printf 'RAW-EVIDENCE-IMAGE-BYTES payload for the single-member detour\n' > disk.img
+tar --format=ustar -cf oneimg.tar disk.img
+gzip -n -c oneimg.tar > oneimg.tgz
 ```
 
 ## Files
@@ -57,4 +62,5 @@ gzip -n -c leaf.txt | gzip -n -c > leaf.txt.gz.gz
 | `fixtures/payload.7z` | 7z (LZMA2) | `archive_7z.rs`, `resolve.rs` |
 | `fixtures/nested.tbz.zip` | ZIP → `.tbz` → tar | `resolve.rs` (the multi-layer case) |
 | `fixtures/leaf.txt.gz.gz` | gzip(gzip(text)) | `resolve.rs` (double bare wrapper) |
+| `fixtures/oneimg.tgz` | single-member tar.gz (`disk.img`) | `detour.rs` (single-member detour) |
 | `fixtures/payload.bz2` | bare bzip2 | `peel.rs` (pre-existing) |
