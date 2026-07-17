@@ -19,6 +19,10 @@ thiserror.workspace = true
 # Pure-Rust compression decoders (no C) for the tar.gz / tar.bz2 outer layer.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 bzip2-rs = "0.1"
+# tar member walking. default-features = false drops the `xattr` extraction
+# path (we only read members into memory, never restore to disk); the remaining
+# tree is pure-Rust + libc bindings (no bundled C compiled/linked).
+tar = { version = "0.4", default-features = false }
 
 [lints]
 workspace = true

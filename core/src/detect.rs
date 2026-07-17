@@ -14,6 +14,10 @@ pub enum Format {
     TarGz,
     /// tar compressed with bzip2 (`.tbz2` / `.tar.bz2`) — a member list.
     TarBz2,
+    /// Uncompressed tar (`ustar`/v7) — a member list. Detected by the `ustar`
+    /// magic at offset 257, so a bare-compressed tar peeled to its inner stream
+    /// is recognized regardless of its (now-stripped) name.
+    Tar,
     /// ZIP archive — a member list.
     Zip,
     /// 7-Zip archive — a member list.
@@ -29,12 +33,12 @@ impl Format {
         matches!(self, Format::Gzip | Format::Bzip2)
     }
 
-    /// A multi-member archive (tar.gz / tar.bz2 / zip / 7z).
+    /// A multi-member archive (tar / tar.gz / tar.bz2 / zip / 7z).
     #[must_use]
     pub fn is_archive(self) -> bool {
         matches!(
             self,
-            Format::TarGz | Format::TarBz2 | Format::Zip | Format::SevenZip
+            Format::Tar | Format::TarGz | Format::TarBz2 | Format::Zip | Format::SevenZip
         )
     }
 }
@@ -51,6 +55,13 @@ pub fn sniff(name: Option<&str>, head: &[u8]) -> Format {
     }
     if head.starts_with(b"PK\x03\x04") {
         return Format::Zip;
+    }
+    // Uncompressed tar: the `ustar` magic lives at offset 257 (POSIX writes
+    // "ustar\0", GNU "ustar  "; both begin "ustar"). Checked by magic so a
+    // bare-compressed tar peeled to its inner stream is recognized even after
+    // its `.tbz`/`.tgz` name was stripped.
+    if head.len() >= 262 && &head[257..262] == b"ustar" {
+        return Format::Tar;
     }
     // Compression codecs: the name decides tar-inside vs bare single file.
     let lower = name.map(str::to_ascii_lowercase);
@@ -84,6 +95,9 @@ pub fn sniff(name: Option<&str>, head: &[u8]) -> Format {
     }
     if ends(".tbz2") || ends(".tar.bz2") {
         return Format::TarBz2;
+    }
+    if ends(".tar") {
+        return Format::Tar;
     }
     if ends(".gz") {
         return Format::Gzip;

@@ -16,10 +16,12 @@
 //! hard output cap.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod archive;
 mod detect;
 mod error;
 mod peel;
 
+pub use archive::{Archive, ArchiveEntry};
 pub use detect::{sniff, Format};
 pub use error::{ArchiveError, Result};
 pub use peel::{peel_bytes, PeelOutcome};
