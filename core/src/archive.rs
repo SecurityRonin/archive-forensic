@@ -35,6 +35,10 @@ pub struct Archive {
 enum Backend {
     /// The decompressed tar byte stream; members are walked on demand.
     Tar { bytes: Vec<u8> },
+    /// The fleet ZIP reader over the archive bytes.
+    Zip {
+        archive: zip_core::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    },
 }
 
 impl Archive {
@@ -53,6 +57,7 @@ impl Archive {
             Format::Tar => Self::open_tar(format, data.to_vec()).map(Some),
             Format::TarGz => Self::open_tar(format, decode_gzip(data)?).map(Some),
             Format::TarBz2 => Self::open_tar(format, decode_bzip2(data)?).map(Some),
+            Format::Zip => Self::open_zip(data).map(Some),
             _ => Ok(None),
         }
     }
@@ -80,8 +85,9 @@ impl Archive {
         if index >= count {
             return Err(ArchiveError::IndexOutOfRange { index, count });
         }
-        match &self.backend {
+        match &mut self.backend {
             Backend::Tar { bytes } => read_tar_member(bytes, index),
+            Backend::Zip { archive } => read_zip_member(archive, index),
         }
     }
 
@@ -119,6 +125,35 @@ impl Archive {
             backend: Backend::Tar { bytes },
         })
     }
+
+    /// Build a ZIP [`Archive`] via the fleet `zip-forensic-core` reader.
+    fn open_zip(data: &[u8]) -> Result<Archive> {
+        let mut archive =
+            zip_core::ZipArchive::new(std::io::Cursor::new(data.to_vec())).map_err(|e| {
+                ArchiveError::Open {
+                    format: "zip",
+                    detail: e.to_string(),
+                }
+            })?;
+        let count = archive.len();
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let f = archive.by_index(i).map_err(|e| ArchiveError::Open {
+                format: "zip",
+                detail: e.to_string(),
+            })?;
+            entries.push(ArchiveEntry {
+                name: f.name().to_string(),
+                size: f.size(),
+                is_dir: f.is_dir(),
+            });
+        }
+        Ok(Archive {
+            format: Format::Zip,
+            entries,
+            backend: Backend::Zip { archive },
+        })
+    }
 }
 
 /// Stream the `index`-th tar member's bytes, capped and CRC-agnostic (tar has no
@@ -147,6 +182,31 @@ fn read_tar_member(bytes: &[u8], index: usize) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .map_err(|e| ArchiveError::Read {
             format: "tar",
+            detail: e.to_string(),
+        })?;
+    if out.len() as u64 > MAX_INFLATED {
+        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
+    }
+    Ok(out)
+}
+
+/// Extract the `index`-th ZIP member, capped. The fleet reader verifies CRC-32
+/// at EOF and fails loud on mismatch.
+fn read_zip_member(
+    archive: &mut zip_core::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    index: usize,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let zf = archive.by_index(index).map_err(|e| ArchiveError::Read {
+        format: "zip",
+        detail: e.to_string(),
+    })?;
+    let mut out = Vec::new();
+    let mut limited = zf.take(MAX_INFLATED + 1);
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| ArchiveError::Read {
+            format: "zip",
             detail: e.to_string(),
         })?;
     if out.len() as u64 > MAX_INFLATED {

@@ -23,6 +23,9 @@ bzip2-rs = "0.1"
 # path (we only read members into memory, never restore to disk); the remaining
 # tree is pure-Rust + libc bindings (no bundled C compiled/linked).
 tar = { version = "0.4", default-features = false }
+# ZIP (.zip / .clbx) reader — the fleet's own pure-Rust, no-C-FFI reader
+# (imports as `zip_core`). Prefer ours over any third-party zip crate.
+zip-forensic-core = "0.2"
 
 [lints]
 workspace = true
