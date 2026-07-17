@@ -32,12 +32,20 @@ pub struct Archive {
 }
 
 /// The concrete reader behind an [`Archive`]. One variant per reused backend.
+// The 7z `ArchiveReader` is larger than the tar/zip variants, but exactly one
+// `Backend` exists per `Archive` and they are never held in a collection, so the
+// per-value size gap the lint guards against is immaterial here.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     /// The decompressed tar byte stream; members are walked on demand.
     Tar { bytes: Vec<u8> },
     /// The fleet ZIP reader over the archive bytes.
     Zip {
         archive: zip_core::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    },
+    /// The `sevenz-rust2` reader over the archive bytes.
+    SevenZip {
+        reader: sevenz_rust2::ArchiveReader<std::io::Cursor<Vec<u8>>>,
     },
 }
 
@@ -58,6 +66,7 @@ impl Archive {
             Format::TarGz => Self::open_tar(format, decode_gzip(data)?).map(Some),
             Format::TarBz2 => Self::open_tar(format, decode_bzip2(data)?).map(Some),
             Format::Zip => Self::open_zip(data).map(Some),
+            Format::SevenZip => Self::open_7z(data).map(Some),
             _ => Ok(None),
         }
     }
@@ -85,9 +94,16 @@ impl Archive {
         if index >= count {
             return Err(ArchiveError::IndexOutOfRange { index, count });
         }
+        // 7z extracts by name; capture it (and the declared size for the
+        // pre-alloc cap) before borrowing the backend mutably.
+        let (name, declared_size) = {
+            let e = &self.entries[index];
+            (e.name.clone(), e.size)
+        };
         match &mut self.backend {
             Backend::Tar { bytes } => read_tar_member(bytes, index),
             Backend::Zip { archive } => read_zip_member(archive, index),
+            Backend::SevenZip { reader } => read_7z_member(reader, &name, declared_size),
         }
     }
 
@@ -154,6 +170,33 @@ impl Archive {
             backend: Backend::Zip { archive },
         })
     }
+
+    /// Build a 7z [`Archive`] via `sevenz-rust2`.
+    fn open_7z(data: &[u8]) -> Result<Archive> {
+        let reader = sevenz_rust2::ArchiveReader::new(
+            std::io::Cursor::new(data.to_vec()),
+            sevenz_rust2::Password::empty(),
+        )
+        .map_err(|e| ArchiveError::Open {
+            format: "7z",
+            detail: e.to_string(),
+        })?;
+        let entries = reader
+            .archive()
+            .files
+            .iter()
+            .map(|f| ArchiveEntry {
+                name: f.name.clone(),
+                size: f.size,
+                is_dir: f.is_directory,
+            })
+            .collect();
+        Ok(Archive {
+            format: Format::SevenZip,
+            entries,
+            backend: Backend::SevenZip { reader },
+        })
+    }
 }
 
 /// Stream the `index`-th tar member's bytes, capped and CRC-agnostic (tar has no
@@ -209,6 +252,28 @@ fn read_zip_member(
             format: "zip",
             detail: e.to_string(),
         })?;
+    if out.len() as u64 > MAX_INFLATED {
+        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
+    }
+    Ok(out)
+}
+
+/// Extract a 7z member by name. `sevenz-rust2` decodes the whole member; an
+/// unsupported-codec member surfaces as a loud [`ArchiveError::Read`] carrying
+/// the backend's diagnostic (never a silent skip). The declared size is checked
+/// against the cap before decoding, and the output length after.
+fn read_7z_member(
+    reader: &mut sevenz_rust2::ArchiveReader<std::io::Cursor<Vec<u8>>>,
+    name: &str,
+    declared_size: u64,
+) -> Result<Vec<u8>> {
+    if declared_size > MAX_INFLATED {
+        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
+    }
+    let out = reader.read_file(name).map_err(|e| ArchiveError::Read {
+        format: "7z",
+        detail: e.to_string(),
+    })?;
     if out.len() as u64 > MAX_INFLATED {
         return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
     }
