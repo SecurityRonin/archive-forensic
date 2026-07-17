@@ -20,8 +20,10 @@ mod archive;
 mod detect;
 mod error;
 mod peel;
+mod resolve;
 
 pub use archive::{Archive, ArchiveEntry};
 pub use detect::{sniff, Format};
 pub use error::{ArchiveError, Result};
 pub use peel::{peel_bytes, PeelOutcome};
+pub use resolve::{resolve, Limits, Node};
