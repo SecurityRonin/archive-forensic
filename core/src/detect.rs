@@ -43,10 +43,17 @@ impl Format {
     }
 }
 
+/// The name-suffix set for a bzip2-compressed tar. `.tbz2`, `.tbz`, and `.tb2`
+/// are all common short aliases for `.tar.bz2` (e7z / GNU tar). One place so the
+/// magic branch and the magic-silent fallback stay in sync.
+fn is_tar_bz2_name(ends: &impl Fn(&str) -> bool) -> bool {
+    ends(".tar.bz2") || ends(".tbz2") || ends(".tbz") || ends(".tb2")
+}
+
 /// Determine the packing format. Container identity (zip / 7z) is decided by
-/// **magic**; the tar-compression combos (`.tgz`/`.tbz2`) are distinguished from
-/// bare gzip/bzip2 by the file **name** (the outer magic alone can't tell a
-/// gzipped tar from a gzipped single file).
+/// **magic**; the tar-compression combos (`.tgz`/`.tbz2`/`.tbz`/`.tb2`) are
+/// distinguished from bare gzip/bzip2 by the file **name** (the outer magic
+/// alone can't tell a gzipped tar from a gzipped single file).
 #[must_use]
 pub fn sniff(name: Option<&str>, head: &[u8]) -> Format {
     // Containers with a definitive magic.
@@ -74,7 +81,7 @@ pub fn sniff(name: Option<&str>, head: &[u8]) -> Format {
         };
     }
     if head.starts_with(b"BZh") {
-        return if ends(".tbz2") || ends(".tar.bz2") {
+        return if is_tar_bz2_name(&ends) {
             Format::TarBz2
         } else {
             Format::Bzip2
@@ -93,7 +100,7 @@ pub fn sniff(name: Option<&str>, head: &[u8]) -> Format {
     if ends(".tgz") || ends(".tar.gz") {
         return Format::TarGz;
     }
-    if ends(".tbz2") || ends(".tar.bz2") {
+    if is_tar_bz2_name(&ends) {
         return Format::TarBz2;
     }
     if ends(".tar") {
