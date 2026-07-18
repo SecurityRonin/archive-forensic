@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "archive-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bzip2-rs",
  "flate2",
@@ -305,7 +305,9 @@ dependencies = [
 
 [[package]]
 name = "forensic-vfs"
-version = "0.4.0"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eab2d8082616745f512d68b3acdde7a99f832efd5fa2da2c1cdec06f42b7485b"
 dependencies = [
  "forensicnomicon-core",
  "state-history-forensic",
