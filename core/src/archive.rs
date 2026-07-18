@@ -279,3 +279,107 @@ fn read_7z_member(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Build an uncompressed `ustar` archive from `(name, bytes)` members.
+    fn build_tar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, data) in members {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, data.as_slice()).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    // The load-bearing streaming property: `cap = 1200` is LESS than the combined
+    // decompressed tar (two members × 512-byte header + 1024-byte padded data,
+    // plus 1024 bytes of end blocks ≈ 3584 bytes) but MORE than either single
+    // member (1000 bytes). A whole-tar materialization under this cap would
+    // exceed it and fail `TooLarge`; the streaming per-member extract must
+    // succeed because the whole decompressed tar is never held at once.
+    #[test]
+    fn streaming_targz_extracts_each_member_under_whole_tar_cap() {
+        let a = vec![0xAA_u8; 1000];
+        let b = vec![0xBB_u8; 1000];
+        let tar = build_tar(&[("a.bin", a.clone()), ("b.bin", b.clone())]);
+        assert!(
+            tar.len() as u64 > 1200,
+            "combined tar ({}) must exceed the per-member cap",
+            tar.len()
+        );
+        let targz = gzip(&tar);
+        assert_eq!(
+            extract_tar_member_streaming(&targz, Format::TarGz, 0, 1200).unwrap(),
+            a
+        );
+        assert_eq!(
+            extract_tar_member_streaming(&targz, Format::TarGz, 1, 1200).unwrap(),
+            b
+        );
+    }
+
+    #[test]
+    fn streaming_plain_tar_extracts_member() {
+        let a = vec![0x11_u8; 800];
+        let b = vec![0x22_u8; 800];
+        let tar = build_tar(&[("a.bin", a.clone()), ("b.bin", b.clone())]);
+        assert_eq!(
+            extract_tar_member_streaming(&tar, Format::Tar, 0, MAX_INFLATED).unwrap(),
+            a
+        );
+        assert_eq!(
+            extract_tar_member_streaming(&tar, Format::Tar, 1, MAX_INFLATED).unwrap(),
+            b
+        );
+    }
+
+    #[test]
+    fn streaming_member_over_cap_fails_loud() {
+        let targz = gzip(&build_tar(&[("a.bin", vec![0xAA_u8; 1000])]));
+        match extract_tar_member_streaming(&targz, Format::TarGz, 0, 500) {
+            Err(ArchiveError::TooLarge { cap }) => assert_eq!(cap, 500),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_bad_index_fails_loud() {
+        let tar = build_tar(&[("only.bin", vec![0x33_u8; 10])]);
+        assert!(matches!(
+            extract_tar_member_streaming(&tar, Format::Tar, 99, MAX_INFLATED),
+            Err(ArchiveError::IndexOutOfRange { .. })
+        ));
+    }
+
+    // bzip2 uses the identical streaming code path; drive it through the public
+    // `Archive` so the `TarBz2` arm is exercised in both `open_tar` (listing) and
+    // `read` (extraction).
+    const PAYLOAD_TBZ2: &[u8] = include_bytes!("../../tests/data/fixtures/payload.tbz2");
+
+    #[test]
+    fn streaming_tbz2_reads_member_via_same_path() {
+        let mut a = Archive::open(PAYLOAD_TBZ2, Some("payload.tbz2"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.format(), Format::TarBz2);
+        let ia = a
+            .entries()
+            .iter()
+            .position(|e| e.name == "a.txt" && !e.is_dir)
+            .unwrap();
+        assert_eq!(a.read(ia).unwrap(), b"alpha member contents\n");
+    }
+}
