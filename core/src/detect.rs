@@ -107,3 +107,30 @@ pub fn sniff(name: Option<&str>, head: &[u8]) -> Format {
     }
     Format::Unknown
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `.tb2`/`.tbz` are the common short aliases for `.tar.bz2` (e7z, GNU tar):
+    // bzip2-compressed tar. With `BZh` magic they must sniff as TarBz2 (an
+    // archive), NOT bare Bzip2 — the magic alone can't tell a bzipped tar from a
+    // bzipped single file, so the name decides.
+    #[test]
+    fn tbz_and_tb2_aliases_are_tar_bzip2() {
+        for name in ["evidence.tb2", "evidence.tbz", "EVIDENCE.TB2"] {
+            assert_eq!(sniff(Some(name), b"BZh9"), Format::TarBz2, "{name}");
+        }
+        // A genuine bare bzip2 single file stays bare.
+        assert_eq!(sniff(Some("notes.txt.bz2"), b"BZh9"), Format::Bzip2);
+        assert_eq!(sniff(Some("disk.dd.bz2"), b"BZh9"), Format::Bzip2);
+    }
+
+    // The same aliases resolve when the magic is silent (renamed / stripped head).
+    #[test]
+    fn tbz_and_tb2_aliases_resolve_by_name_when_magic_silent() {
+        for name in ["evidence.tb2", "evidence.tbz"] {
+            assert_eq!(sniff(Some(name), b"\x00\x01\x02"), Format::TarBz2, "{name}");
+        }
+    }
+}
