@@ -30,6 +30,9 @@ zip-forensic-core = "0.2"
 # are all pure-Rust: bzip2 resolves to libbz2-rs-sys (a Rust port, no bundled C),
 # and the C-linking `zstd` codec is a non-default feature we do NOT enable.
 sevenz-rust2 = "0.21"
+# Temp-file spill for the streaming peel executor (SpillToTemp/Zran access):
+# pure-Rust + libc, RAII-deleted on drop. No bundled C.
+tempfile = "3"
 
 [lints]
 workspace = true

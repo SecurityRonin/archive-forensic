@@ -20,6 +20,7 @@ mod archive;
 mod archive_layer;
 mod detect;
 mod error;
+mod execute;
 mod peel;
 mod plan;
 mod resolve;
@@ -28,6 +29,9 @@ pub use archive::{Archive, ArchiveEntry};
 pub use archive_layer::{peel_archive, Peel};
 pub use detect::{sniff, Format};
 pub use error::{ArchiveError, Result};
+pub use execute::{
+    peel_archive_seekable, PeelSource, PeeledSource, ReadSeek, SubRange, TempBacked,
+};
 pub use peel::{peel_bytes, PeelOutcome};
 pub use plan::{detect, Access, AccessPlan, Codec, Segment, SegmentKind};
 pub use resolve::{resolve, Limits, Node};
