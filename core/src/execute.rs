@@ -364,6 +364,192 @@ mod tests {
         e.finish().unwrap()
     }
 
+    /// A deterministic, non-repeating byte pattern of length `n` (so a wrong
+    /// offset yields visibly wrong bytes, unlike an all-equal fill).
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Hand-assemble a single-member ZIP whose one file member `name` holds
+    /// `payload` compressed with method 8 (Deflate) at `level`. `Compression::none()`
+    /// emits stored (`BTYPE=00`) deflate blocks — the byte-addressable fast path a
+    /// forensic `E01`-in-zip uses; a real compression level emits Huffman blocks.
+    fn deflate_zip(name: &str, payload: &[u8], level: Compression) -> Vec<u8> {
+        use flate2::write::DeflateEncoder;
+        let mut enc = DeflateEncoder::new(Vec::new(), level);
+        enc.write_all(payload).unwrap();
+        let comp = enc.finish().unwrap();
+        let mut crc = flate2::Crc::new();
+        crc.update(payload);
+        let crc = crc.sum();
+        let nb = name.as_bytes();
+        let (csz, usz, nlen) = (comp.len() as u32, payload.len() as u32, nb.len() as u16);
+
+        let mut z = Vec::new();
+        // Local file header.
+        z.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0u16.to_le_bytes()); // flags
+        z.extend_from_slice(&8u16.to_le_bytes()); // method: deflate
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        z.extend_from_slice(&crc.to_le_bytes());
+        z.extend_from_slice(&csz.to_le_bytes());
+        z.extend_from_slice(&usz.to_le_bytes());
+        z.extend_from_slice(&nlen.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        z.extend_from_slice(nb);
+        z.extend_from_slice(&comp);
+        let cd_offset = z.len() as u32;
+        // Central directory file header.
+        z.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        z.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0u16.to_le_bytes()); // flags
+        z.extend_from_slice(&8u16.to_le_bytes()); // method
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        z.extend_from_slice(&crc.to_le_bytes());
+        z.extend_from_slice(&csz.to_le_bytes());
+        z.extend_from_slice(&usz.to_le_bytes());
+        z.extend_from_slice(&nlen.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        z.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        z.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        z.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        z.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        z.extend_from_slice(nb);
+        let cd_size = z.len() as u32 - cd_offset;
+        // End of central directory.
+        z.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk num
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk with cd
+        z.extend_from_slice(&1u16.to_le_bytes()); // entries this disk
+        z.extend_from_slice(&1u16.to_le_bytes()); // total entries
+        z.extend_from_slice(&cd_size.to_le_bytes());
+        z.extend_from_slice(&cd_offset.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        z
+    }
+
+    // (Phase 3, a) A Deflate zip member → a Zran-backed seekable handle (NOT a
+    // temp spill): random reads at start / a stored-block boundary / the end / a
+    // backward re-seek all return the exact decompressed bytes, and a full read
+    // reproduces the member. Uses `Compression::none()` so the deflate stream is a
+    // run of stored blocks spanning several 64 KiB boundaries — the byte-addressable
+    // fast path with no full inflate.
+    #[test]
+    fn deflate_member_zran_random_access() {
+        let payload = pattern(200_000);
+        let data = deflate_zip("big.dd", &payload, Compression::none());
+        assert!(
+            matches!(
+                detect(&data).unwrap(),
+                AccessPlan::Member {
+                    access: Access::Zran,
+                    ..
+                }
+            ),
+            "a Deflate member routes to Zran"
+        );
+        let PeelSource::Inner(PeeledSource::Zran(mut z)) =
+            peel_archive_seekable(data, Some("big.dd.zip"), &Limits::default()).unwrap()
+        else {
+            panic!("expected a Zran-backed peel");
+        };
+        assert_eq!(z.len(), payload.len() as u64);
+        assert!(!z.is_empty());
+
+        // Start.
+        z.seek(SeekFrom::Start(0)).unwrap();
+        let mut head = vec![0u8; 4096];
+        z.read_exact(&mut head).unwrap();
+        assert_eq!(head, payload[..4096]);
+
+        // A read straddling a 65 535-byte stored-block boundary.
+        let mid = 65_535 - 10;
+        z.seek(SeekFrom::Start(mid as u64)).unwrap();
+        let mut span = vec![0u8; 5000];
+        z.read_exact(&mut span).unwrap();
+        assert_eq!(span, payload[mid..mid + 5000]);
+
+        // End-relative.
+        z.seek(SeekFrom::End(-100)).unwrap();
+        let mut tail = vec![0u8; 100];
+        z.read_exact(&mut tail).unwrap();
+        assert_eq!(tail, payload[payload.len() - 100..]);
+
+        // Backward re-seek.
+        z.seek(SeekFrom::Start(1234)).unwrap();
+        let mut back = vec![0u8; 2000];
+        z.read_exact(&mut back).unwrap();
+        assert_eq!(back, payload[1234..1234 + 2000]);
+
+        // Full read from the start reproduces the member.
+        z.seek(SeekFrom::Start(0)).unwrap();
+        let mut all = Vec::new();
+        z.read_to_end(&mut all).unwrap();
+        assert_eq!(all, payload);
+    }
+
+    // (Phase 3, a2) A genuinely-compressed Deflate member (Huffman blocks, not
+    // stored) is still served by the Zran executor with correct random reads.
+    #[test]
+    fn genuinely_compressed_deflate_member_zran_reads_correctly() {
+        let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(4000);
+        let data = deflate_zip("log.txt", &payload, Compression::best());
+        let PeelSource::Inner(PeeledSource::Zran(mut z)) =
+            peel_archive_seekable(data, Some("log.txt.zip"), &Limits::default()).unwrap()
+        else {
+            panic!("expected a Zran-backed peel");
+        };
+        assert_eq!(z.len(), payload.len() as u64);
+        let off = payload.len() / 2;
+        z.seek(SeekFrom::Start(off as u64)).unwrap();
+        let mut got = vec![0u8; 3000];
+        z.read_exact(&mut got).unwrap();
+        assert_eq!(got, payload[off..off + 3000]);
+    }
+
+    // (Phase 3, b/c) The Zran path yields the Zran variant, never a Temp spill of
+    // the decompressed member — the member is randomly accessed, never inflated to
+    // a temp file.
+    #[test]
+    fn zran_path_does_not_spill_decompressed_member() {
+        let payload = pattern(120_000);
+        let data = deflate_zip("img.dd", &payload, Compression::none());
+        match peel_archive_seekable(data, Some("img.dd.zip"), &Limits::default()).unwrap() {
+            PeelSource::Inner(PeeledSource::Zran(_)) => {}
+            other => panic!("expected Zran (no decompressed-member spill), got {other:?}"),
+        }
+    }
+
+    // (Phase 3, d) The index-size coverage gate: when a zran checkpoint index would
+    // exceed `max_index_bytes`, the executor falls back to a temp spill (which still
+    // yields the exact member bytes) rather than building an unbounded index.
+    #[test]
+    fn zran_index_cap_falls_back_to_spill() {
+        let payload = pattern(120_000);
+        let expected = payload.clone();
+        let data = deflate_zip("img.dd", &payload, Compression::none());
+        let limits = Limits {
+            max_index_bytes: 1,
+            ..Limits::default()
+        };
+        match peel_archive_seekable(data, Some("img.dd.zip"), &limits).unwrap() {
+            PeelSource::Inner(PeeledSource::Temp(mut t)) => {
+                let mut got = Vec::new();
+                t.read_to_end(&mut got).unwrap();
+                assert_eq!(
+                    got, expected,
+                    "spill fallback still yields the member bytes"
+                );
+            }
+            other => panic!("expected a Temp spill fallback, got {other:?}"),
+        }
+    }
+
     /// The oracle bytes of the single file member of `archive`.
     fn member_oracle(data: &[u8], name: &str, member: &str) -> Vec<u8> {
         let mut a = Archive::open(data, Some(name)).unwrap().unwrap();
