@@ -166,14 +166,12 @@ fn detect_wrapper(codec: Codec, data: &[u8]) -> Result<AccessPlan> {
 /// uniform split set → [`AccessPlan::SegmentSet`]; exactly one file member →
 /// [`AccessPlan::Member`]; otherwise a [`AccessPlan::Collection`].
 fn detect_archive(format: Format, data: &[u8]) -> Result<AccessPlan> {
-    let mut archive = Archive::open_with_format(format, data)?.ok_or_else(|| {
+    let Some(mut archive) = Archive::open_with_format(format, data)? else {
         // cov:unreachable: detect_archive is only ever called with an archive
-        // format, for which open_with_format returns Some (or an Err, caught by ?).
-        ArchiveError::Open {
-            format: "archive",
-            detail: format!("{format:?} sniffed as an archive but did not open"),
-        }
-    })?;
+        // format, for which open_with_format returns Some (a real open failure
+        // surfaces as an Err, caught by `?` above).
+        return Ok(AccessPlan::Collection { format });
+    };
     // File members only (directories are structure, not evidence), original
     // index kept so `member_access` can address them.
     let files: Vec<(usize, String)> = archive
@@ -639,5 +637,13 @@ mod tests {
         assert_eq!(vmdk_segment("disk.vmdk"), None); // monolithic
         assert_eq!(vmdk_segment("disk-flat.vmdk"), None);
         assert_eq!(vmdk_segment("disk-s001.bin"), None); // not vmdk
+    }
+
+    // A `-s` marker whose index is non-numeric (or absent) is not a split-VMDK
+    // segment — the numeric-suffix guard rejects it rather than mis-ordering it.
+    #[test]
+    fn vmdk_segment_rejects_malformed_s_index() {
+        assert_eq!(vmdk_segment("disk-sx.vmdk"), None); // non-digit index
+        assert_eq!(vmdk_segment("disk-s.vmdk"), None); // empty index
     }
 }
