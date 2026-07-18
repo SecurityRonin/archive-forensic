@@ -11,7 +11,7 @@
 
 use crate::detect::{sniff, Format};
 use crate::error::{ArchiveError, Result};
-use crate::peel::{decode_bzip2, decode_gzip, MAX_INFLATED};
+use crate::peel::MAX_INFLATED;
 
 /// One member of an archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,8 +37,10 @@ pub struct Archive {
 // per-value size gap the lint guards against is immaterial here.
 #[allow(clippy::large_enum_variant)]
 enum Backend {
-    /// The decompressed tar byte stream; members are walked on demand.
-    Tar { bytes: Vec<u8> },
+    /// The **compressed** archive bytes plus the outer tar format. Members are
+    /// listed and extracted by streaming a fresh decompressor over these bytes,
+    /// so the whole decompressed tar is never materialized in RAM.
+    Tar { compressed: Vec<u8>, outer: Format },
     /// The fleet ZIP reader over the archive bytes.
     Zip {
         archive: zip_core::ZipArchive<std::io::Cursor<Vec<u8>>>,
@@ -56,15 +58,17 @@ impl Archive {
     /// (`.tgz`/`.tbz2`) from a bare gzip/bzip2 stream.
     ///
     /// # Errors
-    /// [`ArchiveError::Decode`] if the outer compression layer fails to inflate,
-    /// [`ArchiveError::Open`] if the archive directory cannot be parsed, or
-    /// [`ArchiveError::TooLarge`] if the outer inflate exceeds the cap.
+    /// [`ArchiveError::Open`] if the archive directory cannot be parsed (a
+    /// malformed outer compression layer surfaces here while streaming the tar
+    /// listing). The tar family is listed by streaming, so no whole-archive
+    /// inflate happens at open; the [`crate::peel::MAX_INFLATED`] cap is enforced
+    /// per member in [`read`](Archive::read).
     pub fn open(data: &[u8], name: Option<&str>) -> Result<Option<Archive>> {
         let format = sniff(name, data);
         match format {
-            Format::Tar => Self::open_tar(format, data.to_vec()).map(Some),
-            Format::TarGz => Self::open_tar(format, decode_gzip(data)?).map(Some),
-            Format::TarBz2 => Self::open_tar(format, decode_bzip2(data)?).map(Some),
+            Format::Tar | Format::TarGz | Format::TarBz2 => {
+                Self::open_tar(format, data.to_vec()).map(Some)
+            }
             Format::Zip => Self::open_zip(data).map(Some),
             Format::SevenZip => Self::open_7z(data).map(Some),
             _ => Ok(None),
@@ -101,44 +105,52 @@ impl Archive {
             (e.name.clone(), e.size)
         };
         match &mut self.backend {
-            Backend::Tar { bytes } => read_tar_member(bytes, index),
+            Backend::Tar { compressed, outer } => {
+                extract_tar_member_streaming(compressed, *outer, index, MAX_INFLATED)
+            }
             Backend::Zip { archive } => read_zip_member(archive, index),
             Backend::SevenZip { reader } => read_7z_member(reader, &name, declared_size),
         }
     }
 
-    /// Build a tar [`Archive`] over already-decompressed `bytes`.
-    fn open_tar(format: Format, bytes: Vec<u8>) -> Result<Archive> {
-        let mut ar = tar::Archive::new(std::io::Cursor::new(&bytes));
-        let iter = ar.entries().map_err(|e| ArchiveError::Open {
-            format: "tar",
-            detail: e.to_string(),
-        })?;
-        let mut entries = Vec::new();
-        for entry in iter {
-            let entry = entry.map_err(|e| ArchiveError::Open {
+    /// Build a tar [`Archive`] over the still-**compressed** `compressed` bytes,
+    /// listing members by streaming a fresh decompressor. The `tar` crate skips
+    /// each member's body *through* the decompressor, so no member data is
+    /// buffered while listing.
+    fn open_tar(outer: Format, compressed: Vec<u8>) -> Result<Archive> {
+        let entries = {
+            let mut ar = tar::Archive::new(tar_stream(&compressed, outer));
+            let iter = ar.entries().map_err(|e| ArchiveError::Open {
                 format: "tar",
                 detail: e.to_string(),
             })?;
-            let name = entry.path().map_or_else(
-                |_| String::from_utf8_lossy(&entry.path_bytes()).into_owned(),
-                |p| p.to_string_lossy().into_owned(),
-            );
-            let header = entry.header();
-            let size = header.size().map_err(|e| ArchiveError::Open {
-                format: "tar",
-                detail: e.to_string(),
-            })?;
-            entries.push(ArchiveEntry {
-                name,
-                size,
-                is_dir: header.entry_type().is_dir(),
-            });
-        }
+            let mut entries = Vec::new();
+            for entry in iter {
+                let entry = entry.map_err(|e| ArchiveError::Open {
+                    format: "tar",
+                    detail: e.to_string(),
+                })?;
+                let name = entry.path().map_or_else(
+                    |_| String::from_utf8_lossy(&entry.path_bytes()).into_owned(),
+                    |p| p.to_string_lossy().into_owned(),
+                );
+                let header = entry.header();
+                let size = header.size().map_err(|e| ArchiveError::Open {
+                    format: "tar",
+                    detail: e.to_string(),
+                })?;
+                entries.push(ArchiveEntry {
+                    name,
+                    size,
+                    is_dir: header.entry_type().is_dir(),
+                });
+            }
+            entries
+        };
         Ok(Archive {
-            format,
+            format: outer,
             entries,
-            backend: Backend::Tar { bytes },
+            backend: Backend::Tar { compressed, outer },
         })
     }
 
@@ -199,12 +211,33 @@ impl Archive {
     }
 }
 
-/// Stream the `index`-th tar member's bytes, capped and CRC-agnostic (tar has no
-/// per-member checksum on the data). Re-parses from the held bytes so no member
-/// body is retained after listing.
-fn read_tar_member(bytes: &[u8], index: usize) -> Result<Vec<u8>> {
+/// A fresh streaming `Read` over the compressed archive bytes for the given
+/// outer tar format. Each call re-wraps `compressed` from the start, so the
+/// decompressor holds only a bounded window — never the whole decompressed tar.
+fn tar_stream(compressed: &[u8], outer: Format) -> Box<dyn std::io::Read + '_> {
+    let cursor = std::io::Cursor::new(compressed);
+    match outer {
+        Format::TarGz => Box::new(flate2::read::GzDecoder::new(cursor)),
+        Format::TarBz2 => Box::new(bzip2_rs::DecoderReader::new(cursor)),
+        // Plain `Format::Tar` (and, defensively, any non-tar caller) reads the
+        // bytes straight through with no decompression layer.
+        _ => Box::new(cursor),
+    }
+}
+
+/// Stream the `index`-th tar member's bytes over a fresh decompressor, capped at
+/// `cap`. The `tar` crate skips prior members' bodies *through* the stream, so
+/// only this one member is ever read into memory — the whole decompressed tar is
+/// never materialized. Fails loud with [`ArchiveError::TooLarge`] past `cap`.
+/// CRC-agnostic (tar has no per-member data checksum).
+fn extract_tar_member_streaming(
+    compressed: &[u8],
+    outer: Format,
+    index: usize,
+    cap: u64,
+) -> Result<Vec<u8>> {
     use std::io::Read;
-    let mut ar = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut ar = tar::Archive::new(tar_stream(compressed, outer));
     let mut iter = ar.entries().map_err(|e| ArchiveError::Read {
         format: "tar",
         detail: e.to_string(),
@@ -220,15 +253,15 @@ fn read_tar_member(bytes: &[u8], index: usize) -> Result<Vec<u8>> {
             detail: e.to_string(),
         })?;
     let mut out = Vec::new();
-    let mut limited = entry.take(MAX_INFLATED + 1);
+    let mut limited = entry.take(cap + 1);
     limited
         .read_to_end(&mut out)
         .map_err(|e| ArchiveError::Read {
             format: "tar",
             detail: e.to_string(),
         })?;
-    if out.len() as u64 > MAX_INFLATED {
-        return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
+    if out.len() as u64 > cap {
+        return Err(ArchiveError::TooLarge { cap });
     }
     Ok(out)
 }
