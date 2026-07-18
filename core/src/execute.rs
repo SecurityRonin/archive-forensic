@@ -9,8 +9,11 @@
 //! - [`Access::SpillToTemp`] (a compressed member or a bare gzip/bzip2 wrapper) →
 //!   a single streamed decode to a temp file under [`std::env::temp_dir`],
 //!   returned as a [`TempBacked`] handle that RAII-deletes on drop.
-//! - [`Access::Zran`] → treated as [`Access::SpillToTemp`] for now (full decode
-//!   to temp). The checkpoint seek-index is Phase 3.
+//! - [`Access::Zran`] (a Deflate/Deflate64 zip member) → a [`ZranBacked`]
+//!   checkpoint/stored-block seek index (`zip-forensic-core`): random `seek` +
+//!   `read` decode only the block(s) around the target offset, so the decompressed
+//!   member is never materialized in RAM or on disk. A member whose seek index
+//!   would exceed `limits.max_index_bytes` falls back to [`Access::SpillToTemp`].
 //!
 //! Every extraction is capped at `limits.max_total_inflated` and fails loud with
 //! [`ArchiveError::TooLarge`] past it — a decompression bomb never silently
@@ -160,13 +163,78 @@ impl Seek for TempBacked {
     }
 }
 
-/// The peeled inner evidence as a seekable handle: either a zero-copy in-place
-/// window or a temp-backed decode. Both implement [`Read`] + [`Seek`].
+/// A seekable handle over one Deflate/Deflate64 zip member via a checkpoint /
+/// stored-block seek index (`zip-forensic-core`). Random `seek` + `read` decode
+/// only the block(s) around the target offset — the **decompressed** member is
+/// never materialized in RAM or on disk. `zip-forensic-core`'s entry reader is
+/// file-based, so the still-**compressed** archive is held in a temp file
+/// (RAII-deleted on drop); the member is inflated on demand, never spilled.
+pub struct ZranBacked {
+    entry: zip_core::StoredZipEntry,
+    len: u64,
+    pos: u64,
+    // The COMPRESSED archive bytes backing `entry`. Declared last so it drops
+    // after `entry` — the reader's file handle closes before the temp is unlinked
+    // (Windows will not unlink a file with an open handle).
+    archive: tempfile::NamedTempFile,
+}
+
+impl ZranBacked {
+    /// The member's uncompressed length, in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the member is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::fmt::Debug for ZranBacked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZranBacked")
+            .field("len", &self.len)
+            .field("pos", &self.pos)
+            .field("archive", &self.archive.path())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Read for ZranBacked {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.entry.read_at(buf, self.pos)?;
+        self.pos = self.pos.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
+impl Seek for ZranBacked {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let target = match from {
+            SeekFrom::Start(o) => o,
+            SeekFrom::End(o) => offset_from(self.len, o)?,
+            SeekFrom::Current(o) => offset_from(self.pos, o)?,
+        };
+        // Clamp to the member length so reads stop at its end (mirrors `SubRange`).
+        self.pos = target.min(self.len);
+        Ok(self.pos)
+    }
+}
+
+/// The peeled inner evidence as a seekable handle: a zero-copy in-place window, a
+/// zran checkpoint-indexed member, or a temp-backed decode. All implement
+/// [`Read`] + [`Seek`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PeeledSource {
     /// A zero-copy window over the original bytes (no decompression).
     InPlace(SubRange),
+    /// A Deflate/Deflate64 member read through a checkpoint/stored-block seek
+    /// index — random access with no full inflate and no temp spill.
+    Zran(ZranBacked),
     /// A once-decoded stream spilled to a temp file (RAII-deleted on drop).
     Temp(TempBacked),
 }
@@ -175,6 +243,7 @@ impl Read for PeeledSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             PeeledSource::InPlace(s) => s.read(buf),
+            PeeledSource::Zran(z) => z.read(buf),
             PeeledSource::Temp(t) => t.read(buf),
         }
     }
@@ -184,6 +253,7 @@ impl Seek for PeeledSource {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         match self {
             PeeledSource::InPlace(s) => s.seek(from),
+            PeeledSource::Zran(z) => z.seek(from),
             PeeledSource::Temp(t) => t.seek(from),
         }
     }
@@ -237,17 +307,22 @@ pub fn peel_archive_seekable(
         AccessPlan::Member {
             format,
             index,
+            name,
             access,
-            ..
         } => match access {
             // Stored/verbatim → a zero-copy window over the original bytes.
             Access::InPlace { offset, len } => {
                 let sub = SubRange::new(data, offset, len, cap)?;
                 Ok(PeelSource::Inner(PeeledSource::InPlace(sub)))
             }
-            // Phase 3: zran → a checkpoint seek-index. Until then a Deflate member
-            // is decoded in full to temp, exactly like any other compressed codec.
-            Access::Zran | Access::SpillToTemp => {
+            // Deflate/Deflate64 → a checkpoint/stored-block seek index (no full
+            // inflate, no temp spill); an over-cap index falls back to a spill.
+            Access::Zran => Ok(PeelSource::Inner(peel_zran(
+                format, &data, index, &name, limits,
+            )?)),
+            // A non-seekable codec (or a format exposing no in-archive offset) →
+            // a single streamed decode to temp.
+            Access::SpillToTemp => {
                 let temp = spill_member_to_temp(format, &data, index, cap)?;
                 Ok(PeelSource::Inner(PeeledSource::Temp(temp)))
             }
@@ -281,6 +356,104 @@ fn spill_member_to_temp(
         });
     };
     spill(|out| archive.stream_member(index, out, cap))
+}
+
+/// Spacing between saved checkpoints, matching `zip-forensic-core`'s default of
+/// 8 MiB of decompressed output per checkpoint.
+const ZRAN_CHECKPOINT_INTERVAL: u64 = 8 * 1024 * 1024;
+
+/// Upper bound on one checkpoint's serialized window snapshot (~128 KiB).
+const ZRAN_CHECKPOINT_BYTES: u64 = 128 * 1024;
+
+/// Build a [`ZranBacked`] random-access handle for a Deflate/Deflate64 zip member,
+/// or fall back to a one-time temp spill when the seek index would exceed
+/// `limits.max_index_bytes` (design Q3 coverage gate). The **decompressed** member
+/// is never materialized on the zran path — only the compressed archive is held.
+fn peel_zran(
+    format: crate::Format,
+    data: &[u8],
+    index: usize,
+    name: &str,
+    limits: &Limits,
+) -> Result<PeeledSource> {
+    // zran random access is a zip-only capability (member_access only emits Zran
+    // for Deflate/Deflate64 zip members); anything else spills.
+    if format != crate::Format::Zip {
+        // cov:unreachable: only zip Deflate/Deflate64 members route to Zran
+        return spill_member_to_temp(format, data, index, limits.max_total_inflated)
+            .map(PeeledSource::Temp);
+    }
+
+    // Coverage gate: estimate the index memory from the member's declared
+    // uncompressed size and spill instead of building an unbounded index. Declining
+    // zran on a declared-huge member is always safe — the spill path enforces the
+    // observed-output cap, and a lying-small size is caught by the reader's own caps.
+    let size = member_uncompressed_size(format, data, index)?;
+    if estimate_zran_index_bytes(size) > limits.max_index_bytes as u64 {
+        return spill_member_to_temp(format, data, index, limits.max_total_inflated)
+            .map(PeeledSource::Temp);
+    }
+
+    // `zip-forensic-core`'s seekable entry reader is file-based, so the already-in-RAM
+    // COMPRESSED archive is written to a temp file. Reads seek into the deflate
+    // stream on demand; the decompressed member is never spilled.
+    let archive = write_archive_temp(data)?;
+    let entry = zip_core::open_entry(archive.path(), name).map_err(|e| ArchiveError::Read {
+        format: "zip-zran",
+        detail: e.to_string(),
+    })?;
+    let len = entry.len();
+    Ok(PeeledSource::Zran(ZranBacked {
+        entry,
+        len,
+        pos: 0,
+        archive,
+    }))
+}
+
+/// The declared uncompressed size of member `index`, read from the archive's
+/// member table (never a payload decode).
+fn member_uncompressed_size(format: crate::Format, data: &[u8], index: usize) -> Result<u64> {
+    let Some(archive) = Archive::open_with_format(format, data)? else {
+        // cov:unreachable: a Member plan implies an archive format
+        return Err(ArchiveError::Open {
+            format: "archive",
+            detail: "member plan produced for a non-archive format".to_string(),
+        });
+    };
+    let count = archive.entries().len();
+    archive
+        .entries()
+        .get(index)
+        .map(|e| e.size)
+        .ok_or(ArchiveError::IndexOutOfRange { index, count })
+}
+
+/// A conservative upper bound on the seek-index memory for a member of
+/// `uncompressed` bytes: one ~128 KiB checkpoint per 8 MiB of output. This
+/// over-estimates the (cheaper) stored-block index, so the gate errs toward
+/// spilling — never toward an unbounded index.
+fn estimate_zran_index_bytes(uncompressed: u64) -> u64 {
+    let checkpoints = uncompressed.div_ceil(ZRAN_CHECKPOINT_INTERVAL).max(1);
+    checkpoints.saturating_mul(ZRAN_CHECKPOINT_BYTES)
+}
+
+/// Write the still-compressed archive bytes to a fresh temp file so the file-based
+/// `zip-forensic-core` seekable reader can open it. RAII-deleted on drop.
+fn write_archive_temp(data: &[u8]) -> Result<tempfile::NamedTempFile> {
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| ArchiveError::Read {
+        format: "zip-zran",
+        detail: e.to_string(),
+    })?;
+    tmp.write_all(data).map_err(|e| ArchiveError::Read {
+        format: "zip-zran",
+        detail: e.to_string(),
+    })?;
+    tmp.as_file_mut().flush().map_err(|e| ArchiveError::Read {
+        format: "zip-zran",
+        detail: e.to_string(),
+    })?;
+    Ok(tmp)
 }
 
 /// Create a fresh temp file under [`std::env::temp_dir`], run `write_into` to fill
@@ -486,6 +659,19 @@ mod tests {
         z.read_exact(&mut back).unwrap();
         assert_eq!(back, payload[1234..1234 + 2000]);
 
+        // Current-relative seek (skip forward from where the last read left off).
+        assert_eq!(z.seek(SeekFrom::Current(6)).unwrap(), 1234 + 2000 + 6);
+        let mut cur = vec![0u8; 50];
+        z.read_exact(&mut cur).unwrap();
+        assert_eq!(cur, payload[1234 + 2000 + 6..1234 + 2000 + 6 + 50]);
+
+        // A seek past the end clamps to the member length (bounded handle).
+        assert_eq!(
+            z.seek(SeekFrom::Start(u64::MAX)).unwrap(),
+            payload.len() as u64
+        );
+        let _ = format!("{z:?}"); // exercise the Debug view
+
         // Full read from the start reproduces the member.
         z.seek(SeekFrom::Start(0)).unwrap();
         let mut all = Vec::new();
@@ -602,25 +788,22 @@ mod tests {
 
     // (b1) A Deflate zip member → SpillToTemp: a temp-backed handle whose full
     // read equals the decompressed member, and whose temp file is removed on drop.
+    // (Phase 3) The committed `deflate_one.zip` Deflate member now peels to a Zran
+    // handle (Phase 2 spilled it to temp; Phase 3 seeks it in place), reading the
+    // exact decompressed member bytes.
     #[test]
-    fn deflate_member_spills_to_temp_and_cleans_up() {
+    fn deflate_member_reads_via_zran() {
         let data = load("deflate_one.zip");
         let expected = member_oracle(&data, "deflate_one.zip", "big.dd");
-
-        let leftover;
         match peel_archive_seekable(data, Some("deflate_one.zip"), &Limits::default()).unwrap() {
-            PeelSource::Inner(PeeledSource::Temp(mut t)) => {
+            PeelSource::Inner(PeeledSource::Zran(mut z)) => {
+                assert_eq!(z.len(), expected.len() as u64);
                 let mut got = Vec::new();
-                t.read_to_end(&mut got).unwrap();
-                assert_eq!(got, expected, "temp holds the decompressed member");
-                let p = t.path().to_path_buf();
-                assert!(p.exists(), "temp file exists while the handle is live");
-                leftover = p;
-                drop(t);
+                z.read_to_end(&mut got).unwrap();
+                assert_eq!(got, expected, "zran reads the exact decompressed member");
             }
-            other => panic!("expected Temp, got {other:?}"),
+            other => panic!("expected Zran, got {other:?}"),
         }
-        assert!(!leftover.exists(), "temp file removed on drop");
     }
 
     // (b2) A bare gzip wrapper → SpillToTemp of the whole decompressed stream,

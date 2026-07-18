@@ -33,6 +33,10 @@ pub struct Limits {
     pub max_total_inflated: u64,
     /// Cumulative number of archive members across the whole recursion.
     pub max_entries: usize,
+    /// Ceiling on a single member's zran checkpoint/stored-block seek index. A
+    /// member whose index would exceed this falls back to a one-time temp spill
+    /// rather than holding an unbounded index in RAM (design Q3 coverage gate).
+    pub max_index_bytes: usize,
 }
 
 impl Default for Limits {
@@ -41,6 +45,7 @@ impl Default for Limits {
             max_depth: 8,
             max_total_inflated: 4 << 30, // 4 GiB
             max_entries: 1_000_000,
+            max_index_bytes: 512 << 20, // 512 MiB (matches zip-forensic-core)
         }
     }
 }
