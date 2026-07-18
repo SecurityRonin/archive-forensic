@@ -1,4 +1,4 @@
-//! Phase 4 of two-phase archive access (ADR 0008): **SegmentSet reassembly**.
+//! Phase 4 of two-phase archive access (ADR 0008): **`SegmentSet` reassembly**.
 //! A multi-segment image split across archive members (`.E01/.E02/.E03`, split
 //! raw `.001/.002`, split VMDK `-s001/-s002`) is presented as ONE logical
 //! seekable source, built from the per-segment [`PeeledSource`] handles the
@@ -41,11 +41,12 @@
 //! direction — the archive layer must not depend on a CONTAINER crate).
 
 use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use crate::detect::Format;
 use crate::error::Result;
-use crate::execute::PeeledSource;
-use crate::plan::SegmentKind;
+use crate::execute::{execute_member_access, offset_from, PeeledSource};
+use crate::plan::{detect, AccessPlan, SegmentKind};
 use crate::resolve::Limits;
 
 /// The ordered per-segment byte sources of a segmented image, each materialized
@@ -87,9 +88,21 @@ struct ConcatSeg {
 }
 
 impl ConcatSource {
-    /// Stitch `sources` (ordered by segment number) into one logical image.
-    pub(crate) fn new(_sources: Vec<PeeledSource>) -> Self {
-        unimplemented!("phase 4 GREEN")
+    /// Stitch `sources` (ordered by segment number) into one logical image, each
+    /// segment placed at its running logical offset.
+    pub(crate) fn new(sources: Vec<PeeledSource>) -> Self {
+        let mut segs = Vec::with_capacity(sources.len());
+        let mut start = 0u64;
+        for source in sources {
+            let len = source.len();
+            segs.push(ConcatSeg { source, start, len });
+            start = start.saturating_add(len);
+        }
+        ConcatSource {
+            segs,
+            total: start,
+            pos: 0,
+        }
     }
 
     /// The reassembled image's total length, in bytes.
@@ -103,17 +116,48 @@ impl ConcatSource {
     pub fn is_empty(&self) -> bool {
         self.total == 0
     }
+
+    /// Index of the segment containing logical `pos`, or `None` at/after the end.
+    /// Contiguous, ordered segments make this the first segment whose end exceeds
+    /// `pos` — a zero-length segment (`start == end`) is never selected.
+    fn seg_at(&self, pos: u64) -> Option<usize> {
+        let idx = self.segs.partition_point(|s| s.start + s.len <= pos);
+        (idx < self.segs.len()).then_some(idx)
+    }
 }
 
 impl Read for ConcatSource {
-    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        unimplemented!("phase 4 GREEN")
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.total {
+            return Ok(0);
+        }
+        let pos = self.pos;
+        let Some(i) = self.seg_at(pos) else {
+            return Ok(0); // cov:unreachable: pos < total ⇒ a segment contains it
+        };
+        let seg = &mut self.segs[i];
+        let local = pos - seg.start;
+        seg.source.seek(SeekFrom::Start(local))?;
+        // Cap the read at this segment's boundary so one `read` never crosses
+        // into the next segment; a caller's `read_exact` loops across it.
+        let avail = seg.len - local;
+        let want = (buf.len() as u64).min(avail) as usize;
+        let n = seg.source.read(&mut buf[..want])?;
+        self.pos = self.pos.saturating_add(n as u64);
+        Ok(n)
     }
 }
 
 impl Seek for ConcatSource {
-    fn seek(&mut self, _from: SeekFrom) -> io::Result<u64> {
-        unimplemented!("phase 4 GREEN")
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let target = match from {
+            SeekFrom::Start(o) => o,
+            SeekFrom::End(o) => offset_from(self.total, o)?,
+            SeekFrom::Current(o) => offset_from(self.pos, o)?,
+        };
+        // A reassembled image is bounded: clamp so reads stop at its end.
+        self.pos = target.min(self.total);
+        Ok(self.pos)
     }
 }
 
@@ -140,8 +184,33 @@ pub enum Reassembled {
 ///
 /// # Errors
 /// Propagates a detect/executor failure ([`crate::ArchiveError`]).
-pub fn segment_sources(_data: Vec<u8>, _limits: &Limits) -> Result<Option<SegmentSources>> {
-    unimplemented!("phase 4 GREEN")
+pub fn segment_sources(data: Vec<u8>, limits: &Limits) -> Result<Option<SegmentSources>> {
+    let AccessPlan::SegmentSet {
+        format,
+        members,
+        kind,
+    } = detect(&data)?
+    else {
+        return Ok(None);
+    };
+    // Share the archive bytes across every segment window (no per-segment clone).
+    let data = Arc::new(data);
+    let mut sources = Vec::with_capacity(members.len());
+    for seg in &members {
+        sources.push(execute_member_access(
+            format,
+            &data,
+            seg.index,
+            &seg.name,
+            &seg.access,
+            limits,
+        )?);
+    }
+    Ok(Some(SegmentSources {
+        format,
+        kind,
+        sources,
+    }))
 }
 
 /// Reassemble a segmented image: a [`SegmentKind::SplitRaw`] set becomes a
@@ -151,8 +220,17 @@ pub fn segment_sources(_data: Vec<u8>, _limits: &Limits) -> Result<Option<Segmen
 ///
 /// # Errors
 /// Propagates a detect/executor failure ([`crate::ArchiveError`]).
-pub fn reassemble(_data: Vec<u8>, _limits: &Limits) -> Result<Reassembled> {
-    unimplemented!("phase 4 GREEN")
+pub fn reassemble(data: Vec<u8>, limits: &Limits) -> Result<Reassembled> {
+    let Some(ss) = segment_sources(data, limits)? else {
+        return Ok(Reassembled::NotSegmented);
+    };
+    Ok(match ss.kind {
+        // A raw split IS a byte-for-byte concatenation — stitch it here.
+        SegmentKind::SplitRaw => Reassembled::Concat(ConcatSource::new(ss.sources)),
+        // EWF / split-VMDK need the container reader's multi-segment logic;
+        // hand back the ordered sources for its backing (the seam above).
+        SegmentKind::Ewf | SegmentKind::SplitVmdk => Reassembled::Segments(ss),
+    })
 }
 
 #[cfg(test)]

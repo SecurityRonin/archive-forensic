@@ -21,6 +21,7 @@
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::archive::Archive;
 use crate::error::{ArchiveError, Result};
@@ -32,25 +33,39 @@ use crate::resolve::Limits;
 pub trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
-/// A zero-copy, seekable window `[offset, offset + len)` over an owned byte
+/// A zero-copy, seekable window `[offset, offset + len)` over a **shared** byte
 /// buffer. Reading never decompresses and never copies the member into a second
-/// buffer — the bytes come straight from the original archive image.
+/// buffer — the bytes come straight from the original archive image. The backing
+/// is an [`Arc`] so several windows (e.g. every segment of a split set) share one
+/// copy of the archive rather than cloning it per window.
 #[derive(Debug)]
 pub struct SubRange {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     start: u64,
     len: u64,
     pos: u64,
 }
 
 impl SubRange {
-    /// Window `data` to `[offset, offset + len)`.
+    /// Window an owned buffer to `[offset, offset + len)`. A test-only
+    /// convenience over [`SubRange::new_shared`]; production windows share an
+    /// [`Arc`] backing.
     ///
     /// # Errors
     /// [`ArchiveError::TooLarge`] when `len` exceeds `cap`, or
     /// [`ArchiveError::Read`] when the window falls outside `data` (a lying
     /// member offset/size — never trusted).
+    #[cfg(test)]
     fn new(data: Vec<u8>, offset: u64, len: u64, cap: u64) -> Result<Self> {
+        Self::new_shared(Arc::new(data), offset, len, cap)
+    }
+
+    /// Window a shared buffer to `[offset, offset + len)`. Several windows over
+    /// the same [`Arc`] share one copy of the bytes.
+    ///
+    /// # Errors
+    /// Same as [`SubRange::new`].
+    pub(crate) fn new_shared(data: Arc<Vec<u8>>, offset: u64, len: u64, cap: u64) -> Result<Self> {
         if len > cap {
             return Err(ArchiveError::TooLarge { cap });
         }
@@ -239,6 +254,25 @@ pub enum PeeledSource {
     Temp(TempBacked),
 }
 
+impl PeeledSource {
+    /// The peeled member's length in bytes (the in-place window, the member's
+    /// uncompressed size, or the spilled length).
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        match self {
+            PeeledSource::InPlace(s) => s.len(),
+            PeeledSource::Zran(z) => z.len(),
+            PeeledSource::Temp(t) => t.len(),
+        }
+    }
+
+    /// Whether the peeled member is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl Read for PeeledSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -291,7 +325,11 @@ pub fn peel_archive_seekable(
     limits: &Limits,
 ) -> Result<PeelSource> {
     let cap = limits.max_total_inflated;
-    match detect(&data)? {
+    let plan = detect(&data)?;
+    // Share the archive bytes so a Member window (and, in phase 4, every segment
+    // of a split set) borrows one copy rather than cloning per handle.
+    let data = Arc::new(data);
+    match plan {
         // A collection, split set, or raw stream is not a single wrapped image.
         AccessPlan::Direct | AccessPlan::Collection { .. } | AccessPlan::SegmentSet { .. } => {
             Ok(PeelSource::NotPacked)
@@ -309,24 +347,46 @@ pub fn peel_archive_seekable(
             index,
             name,
             access,
-        } => match access {
-            // Stored/verbatim → a zero-copy window over the original bytes.
-            Access::InPlace { offset, len } => {
-                let sub = SubRange::new(data, offset, len, cap)?;
-                Ok(PeelSource::Inner(PeeledSource::InPlace(sub)))
-            }
-            // Deflate/Deflate64 → a checkpoint/stored-block seek index (no full
-            // inflate, no temp spill); an over-cap index falls back to a spill.
-            Access::Zran => Ok(PeelSource::Inner(peel_zran(
-                format, &data, index, &name, limits,
-            )?)),
-            // A non-seekable codec (or a format exposing no in-archive offset) →
-            // a single streamed decode to temp.
-            Access::SpillToTemp => {
-                let temp = spill_member_to_temp(format, &data, index, cap)?;
-                Ok(PeelSource::Inner(PeeledSource::Temp(temp)))
-            }
-        },
+        } => Ok(PeelSource::Inner(execute_member_access(
+            format, &data, index, &name, &access, limits,
+        )?)),
+    }
+}
+
+/// Materialize one archive member's `access` as a seekable [`PeeledSource`],
+/// over the **shared** archive bytes: a Stored member is a zero-copy in-place
+/// window, a Deflate member is a zran checkpoint index (spilling only if the
+/// index would exceed `limits.max_index_bytes`), and anything else is a single
+/// streamed decode to temp. This is the per-member primitive both the single
+/// [`AccessPlan::Member`] path and phase-4 segment reassembly build on.
+///
+/// # Errors
+/// A decode/open/read failure from the underlying layer, or
+/// [`ArchiveError::TooLarge`] when the member exceeds `limits.max_total_inflated`.
+pub(crate) fn execute_member_access(
+    format: crate::Format,
+    data: &Arc<Vec<u8>>,
+    index: usize,
+    name: &str,
+    access: &Access,
+    limits: &Limits,
+) -> Result<PeeledSource> {
+    let cap = limits.max_total_inflated;
+    match *access {
+        // Stored/verbatim → a zero-copy window over the shared original bytes.
+        Access::InPlace { offset, len } => {
+            let sub = SubRange::new_shared(Arc::clone(data), offset, len, cap)?;
+            Ok(PeeledSource::InPlace(sub))
+        }
+        // Deflate/Deflate64 → a checkpoint/stored-block seek index (no full
+        // inflate, no temp spill); an over-cap index falls back to a spill.
+        Access::Zran => peel_zran(format, data, index, name, limits),
+        // A non-seekable codec (or a format exposing no in-archive offset) →
+        // a single streamed decode to temp.
+        Access::SpillToTemp => {
+            let temp = spill_member_to_temp(format, data, index, cap)?;
+            Ok(PeeledSource::Temp(temp))
+        }
     }
 }
 
@@ -509,7 +569,7 @@ fn codec_name(codec: Codec) -> &'static str {
 }
 
 /// Add a signed offset to a base position, failing on under/overflow.
-fn offset_from(base: u64, off: i64) -> io::Result<u64> {
+pub(crate) fn offset_from(base: u64, off: i64) -> io::Result<u64> {
     let r = if off >= 0 {
         base.checked_add(off as u64)
     } else {
