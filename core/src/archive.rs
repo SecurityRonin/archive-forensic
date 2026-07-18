@@ -12,6 +12,7 @@
 use crate::detect::{sniff, Format};
 use crate::error::{ArchiveError, Result};
 use crate::peel::MAX_INFLATED;
+use crate::plan::Access;
 
 /// One member of an archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +65,19 @@ impl Archive {
     /// inflate happens at open; the [`crate::peel::MAX_INFLATED`] cap is enforced
     /// per member in [`read`](Archive::read).
     pub fn open(data: &[u8], name: Option<&str>) -> Result<Option<Archive>> {
-        let format = sniff(name, data);
+        Self::open_with_format(sniff(name, data), data)
+    }
+
+    /// Open `data` under an already-determined `format`, bypassing the
+    /// name-based [`sniff`] — returns `Ok(None)` when `format` is not an archive.
+    /// Phase-1 [`crate::detect`] uses this after classifying the format
+    /// content-authoritatively (so a bare-compressed tar peeled to a known
+    /// `TarGz`/`TarBz2` opens without a name hint).
+    ///
+    /// # Errors
+    /// Same as [`open`](Archive::open): [`ArchiveError::Open`] if the archive
+    /// directory cannot be parsed.
+    pub(crate) fn open_with_format(format: Format, data: &[u8]) -> Result<Option<Archive>> {
         match format {
             Format::Tar | Format::TarGz | Format::TarBz2 => {
                 Self::open_tar(format, data.to_vec()).map(Some)
@@ -72,6 +85,44 @@ impl Archive {
             Format::Zip => Self::open_zip(data).map(Some),
             Format::SevenZip => Self::open_7z(data).map(Some),
             _ => Ok(None),
+        }
+    }
+
+    /// The most-seekable [`Access`] for member `index`, chosen from the member
+    /// table without decompressing (ADR 0008, rule 4). A `Stored`/uncompressed
+    /// zip member is `InPlace` (zero-copy sub-range); `Deflate`/`Deflate64` is
+    /// `Zran`; every other codec — and tar/7z members, which expose no
+    /// in-archive offset or use a non-seekable codec — is `SpillToTemp`.
+    ///
+    /// # Errors
+    /// [`ArchiveError::IndexOutOfRange`] for a bad index, or [`ArchiveError::Read`]
+    /// if a zip member's local header cannot be read.
+    pub fn member_access(&mut self, index: usize) -> Result<Access> {
+        let count = self.entries.len();
+        if index >= count {
+            return Err(ArchiveError::IndexOutOfRange { index, count });
+        }
+        match &mut self.backend {
+            Backend::Zip { archive } => {
+                let f = archive.by_index(index).map_err(|e| ArchiveError::Read {
+                    format: "zip",
+                    // cov:unreachable: open_zip already read this index's header, and
+                    // the index is bounds-checked above — a re-read cannot fail.
+                    detail: e.to_string(),
+                })?;
+                Ok(match f.compression() {
+                    zip_core::CompressionMethod::Stored => Access::InPlace {
+                        offset: f.data_start(),
+                        len: f.compressed_size(),
+                    },
+                    zip_core::CompressionMethod::Deflated
+                    | zip_core::CompressionMethod::Deflate64 => Access::Zran,
+                    _ => Access::SpillToTemp,
+                })
+            }
+            // The tar reader exposes no in-archive member offset, and 7z members
+            // are non-seekable codecs (LZMA/LZMA2) — both spill to temp.
+            Backend::Tar { .. } | Backend::SevenZip { .. } => Ok(Access::SpillToTemp),
         }
     }
 
@@ -401,6 +452,17 @@ mod tests {
     // `Archive` so the `TarBz2` arm is exercised in both `open_tar` (listing) and
     // `read` (extraction).
     const PAYLOAD_TBZ2: &[u8] = include_bytes!("../../tests/data/fixtures/payload.tbz2");
+
+    #[test]
+    fn member_access_out_of_range_fails_loud() {
+        let mut a = Archive::open(PAYLOAD_TBZ2, Some("payload.tbz2"))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            a.member_access(9999),
+            Err(ArchiveError::IndexOutOfRange { .. })
+        ));
+    }
 
     #[test]
     fn streaming_tbz2_reads_member_via_same_path() {

@@ -49,6 +49,23 @@ gzip -n -c leaf.txt | gzip -n -c > leaf.txt.gz.gz
 printf 'RAW-EVIDENCE-IMAGE-BYTES payload for the single-member detour\n' > disk.img
 tar --format=ustar -cf oneimg.tar disk.img
 gzip -n -c oneimg.tar > oneimg.tgz
+
+# --- phase-1 detect() AccessPlan fixtures (plan.rs) ---
+# zip access ladder: one Stored member -> InPlace, one Deflated member -> Zran.
+head -c 4096 /dev/zero | tr '\0' 'A' > disk.dd
+zip -0 -q -X stored_one.zip disk.dd
+head -c 8192 /dev/zero | tr '\0' 'A' > big.dd
+zip -9 -q -X deflate_one.zip big.dd
+
+# segment sets (members added OUT of order to prove numeric ordering):
+printf 'EWF-SEG-1\n' > img.E01; printf 'EWF-SEG-2\n' > img.E02; printf 'EWF-SEG-3\n' > img.E03
+zip -0 -q -X seg_ewf.zip img.E03 img.E01 img.E02
+printf 'RAW-1\n' > disk.001; printf 'RAW-2\n' > disk.002
+zip -0 -q -X seg_split.zip disk.002 disk.001
+
+# a zip member using a non-seekable codec (bzip2, method 12) -> SpillToTemp.
+# The host `zip` lacks bzip2, so mint via Python's zipfile:
+python3 -c "import zipfile; zipfile.ZipFile('bzip2_member.zip','w',zipfile.ZIP_BZIP2).writestr('blob.bin', b'Z'*4096)"
 ```
 
 ## Files
@@ -63,4 +80,9 @@ gzip -n -c oneimg.tar > oneimg.tgz
 | `fixtures/nested.tbz.zip` | ZIP → `.tbz` → tar | `resolve.rs` (the multi-layer case) |
 | `fixtures/leaf.txt.gz.gz` | gzip(gzip(text)) | `resolve.rs` (double bare wrapper) |
 | `fixtures/oneimg.tgz` | single-member tar.gz (`disk.img`) | `detour.rs` (single-member detour) |
-| `fixtures/payload.bz2` | bare bzip2 | `peel.rs` (pre-existing) |
+| `fixtures/payload.bz2` | bare bzip2 | `peel.rs`, `plan.rs` (bare-wrapper case) |
+| `fixtures/stored_one.zip` | ZIP, one Stored member (`disk.dd`, 4096 B) | `plan.rs` (InPlace access) |
+| `fixtures/deflate_one.zip` | ZIP, one Deflated member (`big.dd`, 8192 B) | `plan.rs` (Zran access) |
+| `fixtures/seg_ewf.zip` | ZIP of `img.E01/E02/E03` (out of order) | `plan.rs` (SegmentSet Ewf) |
+| `fixtures/seg_split.zip` | ZIP of `disk.001/002` (out of order) | `plan.rs` (SegmentSet SplitRaw) |
+| `fixtures/bzip2_member.zip` | ZIP, one bzip2 (method 12) member (`blob.bin`) | `plan.rs` (SpillToTemp access) |

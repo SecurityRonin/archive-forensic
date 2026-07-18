@@ -4,8 +4,14 @@
 //! most-direct [`AccessPlan`] route to the evidence. Phase 2 (peel/execute) is a
 //! later step; `detect.rs::peel_detour` is the current executor and coexists.
 
-use crate::detect::Format;
-use crate::error::Result;
+use crate::archive::Archive;
+use crate::detect::{sniff, Format};
+use crate::error::{ArchiveError, Result};
+
+/// Bounded decompressed head peeked per compression layer (rules 2/3). 512 bytes
+/// reaches the deepest packing magic archive-core owns (tar `ustar` at 257);
+/// forensic filesystem magics are the VFS resolver's concern, not ours.
+const HEAD_PEEK: u64 = 512;
 
 /// The access strategy for one member or segment, chosen from the archive's
 /// member table without decompressing (ADR 0008, rule 4 — most-seekable first).
@@ -109,76 +115,215 @@ pub enum AccessPlan {
 /// Propagates an archive open/read failure ([`crate::ArchiveError`]) from reading
 /// the member table (never from inflating a payload — that is phase 2).
 pub fn detect(data: &[u8]) -> Result<AccessPlan> {
-    let _ = data;
-    todo!()
+    // Rule 1: magic decides membership both ways. `sniff` is name-free here.
+    let fmt = sniff(None, data);
+    match fmt {
+        Format::Gzip => detect_wrapper(Codec::Gzip, data),
+        Format::Bzip2 => detect_wrapper(Codec::Bzip2, data),
+        Format::Zip | Format::SevenZip | Format::Tar | Format::TarGz | Format::TarBz2 => {
+            detect_archive(fmt, data)
+        }
+        // `Unknown` (and any future non-packing variant) is not packed → Direct.
+        _ => Ok(AccessPlan::Direct),
+    }
 }
 
 /// A bare gz/bz2 wrapper. Peeks a bounded decompressed head and classifies from
-/// it (rules 2/3).
+/// it (rules 2/3): a decompressed tar routes to the archive branch over the
+/// decompressed member table; a nested archive/wrapper is recorded as a wrapper
+/// (phase 1 spills; recursion is a later phase); anything else is a bare stream.
 fn detect_wrapper(codec: Codec, data: &[u8]) -> Result<AccessPlan> {
-    let _ = (codec, data);
-    todo!()
+    // Rule 2 coincidental-magic guard: valid magic that does not actually decode
+    // is not packed → Direct.
+    let Ok(head) = peek_head(codec, data) else {
+        return Ok(AccessPlan::Direct);
+    };
+    match sniff(None, &head) {
+        Format::Tar => {
+            let archive_fmt = match codec {
+                Codec::Gzip => Format::TarGz,
+                Codec::Bzip2 => Format::TarBz2,
+            };
+            detect_archive(archive_fmt, data)
+        }
+        Format::Zip
+        | Format::SevenZip
+        | Format::Gzip
+        | Format::Bzip2
+        | Format::TarGz
+        | Format::TarBz2 => Ok(AccessPlan::Wrapper {
+            codec,
+            access: Access::SpillToTemp,
+        }),
+        _ => Ok(AccessPlan::Wrapper {
+            codec,
+            access: wrapper_access(codec),
+        }),
+    }
 }
 
-/// Read the archive's member TABLE (never a payload) and classify the set.
+/// Read the archive's member TABLE (never a payload) and classify the set: a
+/// uniform split set → [`AccessPlan::SegmentSet`]; exactly one file member →
+/// [`AccessPlan::Member`]; otherwise a [`AccessPlan::Collection`].
 fn detect_archive(format: Format, data: &[u8]) -> Result<AccessPlan> {
-    let _ = (format, data);
-    todo!()
+    let mut archive = Archive::open_with_format(format, data)?.ok_or_else(|| {
+        // cov:unreachable: detect_archive is only ever called with an archive
+        // format, for which open_with_format returns Some (or an Err, caught by ?).
+        ArchiveError::Open {
+            format: "archive",
+            detail: format!("{format:?} sniffed as an archive but did not open"),
+        }
+    })?;
+    // File members only (directories are structure, not evidence), original
+    // index kept so `member_access` can address them.
+    let files: Vec<(usize, String)> = archive
+        .entries()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.is_dir)
+        .map(|(i, e)| (i, e.name.clone()))
+        .collect();
+
+    // Rule 5: a multi-member set whose names all match one split pattern is a
+    // single logical image — the one place names are load-bearing (ordering).
+    if files.len() >= 2 {
+        if let Some(kind) = classify_segment_kind(&files) {
+            let ordered = order_segments(&files, kind);
+            let mut members = Vec::with_capacity(ordered.len());
+            for (index, name, _seg) in ordered {
+                let access = archive.member_access(index)?;
+                members.push(Segment {
+                    name,
+                    index,
+                    access,
+                });
+            }
+            return Ok(AccessPlan::SegmentSet {
+                format,
+                members,
+                kind,
+            });
+        }
+    }
+
+    match files.as_slice() {
+        [(index, name)] => {
+            let access = archive.member_access(*index)?;
+            Ok(AccessPlan::Member {
+                format,
+                index: *index,
+                name: name.clone(),
+                access,
+            })
+        }
+        // Zero file members (only directory entries) or several independent
+        // items → a tree, each re-resolved on its own.
+        _ => Ok(AccessPlan::Collection { format }),
+    }
 }
 
-/// Decompress at most a bounded head of `data`'s single compressed stream.
+/// Decompress at most [`HEAD_PEEK`] bytes of `data`'s single compressed stream —
+/// never the whole payload (the O(n) property is a type invariant here).
 fn peek_head(codec: Codec, data: &[u8]) -> Result<Vec<u8>> {
-    let _ = (codec, data);
-    todo!()
+    use std::io::Read;
+    let reader: Box<dyn Read> = match codec {
+        Codec::Gzip => Box::new(flate2::read::GzDecoder::new(data)),
+        Codec::Bzip2 => Box::new(bzip2_rs::DecoderReader::new(data)),
+    };
+    let mut out = Vec::new();
+    reader
+        .take(HEAD_PEEK)
+        .read_to_end(&mut out)
+        .map_err(|e| ArchiveError::Decode {
+            format: codec_name(codec),
+            detail: e.to_string(),
+        })?;
+    Ok(out)
 }
 
 /// The best access a bare wrapper's codec allows: gzip → zran, bzip2 → spill.
 fn wrapper_access(codec: Codec) -> Access {
-    let _ = codec;
-    todo!()
+    match codec {
+        Codec::Gzip => Access::Zran,
+        Codec::Bzip2 => Access::SpillToTemp,
+    }
 }
 
 /// A short, stable label for a codec (for diagnostics).
 fn codec_name(codec: Codec) -> &'static str {
-    let _ = codec;
-    todo!()
+    match codec {
+        Codec::Gzip => "gzip",
+        Codec::Bzip2 => "bzip2",
+    }
 }
 
 /// The segment number for `name` under `kind`, or `None` if it does not match.
 fn segment_number(name: &str, kind: SegmentKind) -> Option<u64> {
-    let _ = (name, kind);
-    todo!()
+    match kind {
+        SegmentKind::Ewf => ewf_segment(name),
+        SegmentKind::SplitRaw => raw_split(name),
+        SegmentKind::SplitVmdk => vmdk_segment(name),
+    }
 }
 
 /// The uniform [`SegmentKind`] all `files` match, if any (VMDK, then EWF, then
-/// raw — the three are name-disjoint).
+/// raw — the three name patterns are disjoint, so order only breaks empty ties).
 fn classify_segment_kind(files: &[(usize, String)]) -> Option<SegmentKind> {
-    let _ = files;
-    todo!()
+    [
+        SegmentKind::SplitVmdk,
+        SegmentKind::Ewf,
+        SegmentKind::SplitRaw,
+    ]
+    .into_iter()
+    .find(|&kind| files.iter().all(|(_, n)| segment_number(n, kind).is_some()))
 }
 
 /// The `files` that match `kind`, ordered by segment number.
 fn order_segments(files: &[(usize, String)], kind: SegmentKind) -> Vec<(usize, String, u64)> {
-    let _ = (files, kind);
-    todo!()
+    let mut ordered: Vec<(usize, String, u64)> = files
+        .iter()
+        .filter_map(|(i, n)| segment_number(n, kind).map(|seg| (*i, n.clone(), seg)))
+        .collect();
+    ordered.sort_by_key(|(_, _, seg)| *seg);
+    ordered
 }
 
 /// EWF segment number from an `.E0N`/`.Ex0N`/`.s0N` name (two-digit suffix).
 fn ewf_segment(name: &str) -> Option<u64> {
-    let _ = name;
-    todo!()
+    let (_, ext) = name.rsplit_once('.')?;
+    let ext = ext.to_ascii_lowercase();
+    let digits = ext
+        .strip_prefix("ex")
+        .or_else(|| ext.strip_prefix('e'))
+        .or_else(|| ext.strip_prefix('s'))?;
+    if digits.len() == 2 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse::<u64>().ok()
+    } else {
+        None
+    }
 }
 
 /// Raw-split segment number from an all-digit extension (`.001`, ≥ 2 digits).
 fn raw_split(name: &str) -> Option<u64> {
-    let _ = name;
-    todo!()
+    let (_, ext) = name.rsplit_once('.')?;
+    if ext.len() >= 2 && ext.bytes().all(|b| b.is_ascii_digit()) {
+        ext.parse::<u64>().ok()
+    } else {
+        None
+    }
 }
 
 /// Split-VMDK segment number from a `<base>-sNNN.vmdk` name.
 fn vmdk_segment(name: &str) -> Option<u64> {
-    let _ = name;
-    todo!()
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".vmdk")?;
+    let pos = stem.rfind("-s")?;
+    let num = stem.get(pos + 2..)?;
+    if !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
+        num.parse::<u64>().ok()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +405,62 @@ mod tests {
             detect(b"\x00\x01\x02 not a wrapper or archive").unwrap(),
             AccessPlan::Direct
         );
+    }
+
+    #[test]
+    fn bare_bzip2_of_raw_bytes_is_wrapper_spill() {
+        // payload.bz2 is a bare bzip2 of text (no in-tree bzip2 encoder, so this
+        // is a committed fixture). bzip2 has no block-index yet → SpillToTemp.
+        assert_eq!(
+            detect(&load("payload.bz2")).unwrap(),
+            AccessPlan::Wrapper {
+                codec: Codec::Bzip2,
+                access: Access::SpillToTemp
+            }
+        );
+    }
+
+    #[test]
+    fn coincidental_bzip2_magic_is_direct() {
+        // Valid `BZh` magic that does not decode → not packed (rule 2 guard);
+        // also exercises the bzip2 arm of the bounded-head decoder's error path.
+        assert_eq!(
+            detect(b"BZhnot-a-real-bzip2-stream").unwrap(),
+            AccessPlan::Direct
+        );
+    }
+
+    #[test]
+    fn gzip_of_zip_is_nested_wrapper_spill() {
+        // A bare gzip whose decompressed head is itself an archive (zip): phase 1
+        // records the outer wrapper and spills; nested recursion is a later phase.
+        let gz = gzip(&load("payload.zip"));
+        assert_eq!(
+            detect(&gz).unwrap(),
+            AccessPlan::Wrapper {
+                codec: Codec::Gzip,
+                access: Access::SpillToTemp
+            }
+        );
+    }
+
+    #[test]
+    fn zip_single_bzip2_member_spills() {
+        // A zip member compressed with a non-seekable codec (bzip2, method 12)
+        // → SpillToTemp (the access ladder's last rung).
+        match detect(&load("bzip2_member.zip")).unwrap() {
+            AccessPlan::Member {
+                format,
+                name,
+                access,
+                ..
+            } => {
+                assert_eq!(format, Format::Zip);
+                assert_eq!(name, "blob.bin");
+                assert_eq!(access, Access::SpillToTemp);
+            }
+            other => panic!("expected Member, got {other:?}"),
+        }
     }
 
     // ---- zip access ladder ---------------------------------------------------
