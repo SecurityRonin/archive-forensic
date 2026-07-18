@@ -45,7 +45,7 @@ zip -q -X nested.tbz.zip foo.tbz
 printf 'double gzipped leaf payload\n' > leaf.txt
 gzip -n -c leaf.txt | gzip -n -c > leaf.txt.gz.gz
 
-# single-member archive for the peel_detour single-image case
+# single-member archive for the peel_archive single-image case
 printf 'RAW-EVIDENCE-IMAGE-BYTES payload for the single-member detour\n' > disk.img
 tar --format=ustar -cf oneimg.tar disk.img
 gzip -n -c oneimg.tar > oneimg.tgz
@@ -79,7 +79,7 @@ python3 -c "import zipfile; zipfile.ZipFile('bzip2_member.zip','w',zipfile.ZIP_B
 | `fixtures/payload.7z` | 7z (LZMA2) | `archive_7z.rs`, `resolve.rs` |
 | `fixtures/nested.tbz.zip` | ZIP → `.tbz` → tar | `resolve.rs` (the multi-layer case) |
 | `fixtures/leaf.txt.gz.gz` | gzip(gzip(text)) | `resolve.rs` (double bare wrapper) |
-| `fixtures/oneimg.tgz` | single-member tar.gz (`disk.img`) | `detour.rs` (single-member detour) |
+| `fixtures/oneimg.tgz` | single-member tar.gz (`disk.img`) | `archive_layer.rs` (single-member archive layer) |
 | `fixtures/payload.bz2` | bare bzip2 | `peel.rs`, `plan.rs` (bare-wrapper case) |
 | `fixtures/stored_one.zip` | ZIP, one Stored member (`disk.dd`, 4096 B) | `plan.rs` (InPlace access) |
 | `fixtures/deflate_one.zip` | ZIP, one Deflated member (`big.dd`, 8192 B) | `plan.rs` (Zran access) |

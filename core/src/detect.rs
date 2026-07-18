@@ -22,7 +22,7 @@ pub enum Format {
     Zip,
     /// 7-Zip archive — a member list.
     SevenZip,
-    /// Not a recognized packing layer.
+    /// Not a recognized archive layer.
     Unknown,
 }
 

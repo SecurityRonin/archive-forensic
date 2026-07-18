@@ -2,7 +2,7 @@
 //! name-free classification**. [`detect`] reads only bounded decompressed heads
 //! and the archive's own member *table* — never a payload — and returns the
 //! most-direct [`AccessPlan`] route to the evidence. Phase 2 (peel/execute) is a
-//! later step; `detect.rs::peel_detour` is the current executor and coexists.
+//! later step; `archive_layer.rs::peel_archive` is the current executor and coexists.
 
 use crate::archive::Archive;
 use crate::detect::{sniff, Format};

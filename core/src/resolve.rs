@@ -1,8 +1,8 @@
 //! Recursive multi-layer peeling. [`resolve`] drives [`crate::peel`] and
-//! [`crate::Archive`] together so nested packing layers unwrap **by
+//! [`crate::Archive`] together so nested archive layers unwrap **by
 //! construction**, not as special cases: a bare gzip/bzip2 wrapper peels to one
 //! inner stream that is re-detected; each archive member is re-detected; any
-//! member/stream that is itself a packing layer recurses. So `foo.tbz.zip`
+//! member/stream that is itself a archive layer recurses. So `foo.tbz.zip`
 //! resolves zip -> member `foo.tbz` -> tar -> leaf files, and `.gz.gz`,
 //! `.tar.gz`-in-`.zip`, `.zip`-in-`.7z` all fall out of the same loop.
 //!
@@ -16,7 +16,7 @@ use crate::peel::{peel_bytes, PeelOutcome};
 /// A leaf of a fully-resolved packing tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
-    /// A leaf file (not itself a recognized packing layer) and its bytes.
+    /// A leaf file (not itself a recognized archive layer) and its bytes.
     File { name: String, bytes: Vec<u8> },
     /// A directory entry encountered inside an archive.
     Dir { name: String },
@@ -73,7 +73,7 @@ impl Budget {
     }
 }
 
-/// Fully resolve `data` down through every packing layer to a flat list of leaf
+/// Fully resolve `data` down through every archive layer to a flat list of leaf
 /// files (and the directory entries seen along the way).
 ///
 /// # Errors
@@ -112,7 +112,7 @@ fn resolve_into(
 
     if format.is_compression_wrapper() {
         // One bare gzip/bzip2 layer. peel_bytes is content-driven here (unlike
-        // the disk detour): resolve unwraps everything it recognizes.
+        // the disk archive layer): resolve unwraps everything it recognizes.
         let inner = match peel_bytes(data, name)? {
             PeelOutcome::Peeled { inner, .. } => inner,
             // cov:unreachable: is_compression_wrapper() guarantees a Peeled outcome
