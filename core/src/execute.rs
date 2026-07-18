@@ -51,7 +51,7 @@ impl SubRange {
         if len > cap {
             return Err(ArchiveError::TooLarge { cap });
         }
-        let end = offset
+        offset
             .checked_add(len)
             .filter(|&e| e <= data.len() as u64)
             .ok_or(ArchiveError::Read {
@@ -61,7 +61,6 @@ impl SubRange {
                     data.len()
                 ),
             })?;
-        let _ = end;
         Ok(SubRange {
             data,
             start: offset,
@@ -97,11 +96,10 @@ impl Read for SubRange {
         }
         let n = remaining.min(buf.len() as u64) as usize;
         let start = self.start.saturating_add(self.pos) as usize;
-        let src = match self.data.get(start..start + n) {
-            Some(s) => s,
-            // cov:unreachable: new() proves start+len <= data.len(), and pos <= len,
-            // so start+n never exceeds the buffer.
-            None => return Ok(0),
+        // new() proves start+len <= data.len(), and pos <= len, so start+n never
+        // exceeds the buffer; the guard degrades gracefully if that ever breaks.
+        let Some(src) = self.data.get(start..start + n) else {
+            return Ok(0); // cov:unreachable: window bounds proven in new()
         };
         buf[..n].copy_from_slice(src);
         self.pos += n as u64;
@@ -220,11 +218,121 @@ pub enum PeelSource {
 pub fn peel_archive_seekable(
     data: Vec<u8>,
     _name: Option<&str>,
-    _limits: &Limits,
+    limits: &Limits,
 ) -> Result<PeelSource> {
-    // RED stub — the executor is not wired yet; see the GREEN implementation.
-    let _ = detect(&data)?;
-    Ok(PeelSource::NotPacked)
+    let cap = limits.max_total_inflated;
+    match detect(&data)? {
+        // A collection, split set, or raw stream is not a single wrapped image.
+        AccessPlan::Direct | AccessPlan::Collection { .. } | AccessPlan::SegmentSet { .. } => {
+            Ok(PeelSource::NotPacked)
+        }
+
+        // A bare gzip/bzip2 wrapper: stream the whole decode once to temp.
+        AccessPlan::Wrapper { codec, .. } => {
+            let temp = spill_wrapper_to_temp(&data, codec, cap)?;
+            Ok(PeelSource::Inner(PeeledSource::Temp(temp)))
+        }
+
+        // A single archive member, routed by its most-seekable access.
+        AccessPlan::Member {
+            format,
+            index,
+            access,
+            ..
+        } => match access {
+            // Stored/verbatim → a zero-copy window over the original bytes.
+            Access::InPlace { offset, len } => {
+                let sub = SubRange::new(data, offset, len, cap)?;
+                Ok(PeelSource::Inner(PeeledSource::InPlace(sub)))
+            }
+            // Phase 3: zran → a checkpoint seek-index. Until then a Deflate member
+            // is decoded in full to temp, exactly like any other compressed codec.
+            Access::Zran | Access::SpillToTemp => {
+                let temp = spill_member_to_temp(format, &data, index, cap)?;
+                Ok(PeelSource::Inner(PeeledSource::Temp(temp)))
+            }
+        },
+    }
+}
+
+/// Stream a bare gzip/bzip2 wrapper's whole decoded stream to a temp file.
+fn spill_wrapper_to_temp(data: &[u8], codec: Codec, cap: u64) -> Result<TempBacked> {
+    let reader: Box<dyn Read> = match codec {
+        Codec::Gzip => Box::new(flate2::read::GzDecoder::new(data)),
+        Codec::Bzip2 => Box::new(bzip2_rs::DecoderReader::new(data)),
+    };
+    spill(|out| copy_capped(reader, out, cap, codec_name(codec)))
+}
+
+/// Stream one archive member's decoded bytes to a temp file.
+fn spill_member_to_temp(
+    format: crate::Format,
+    data: &[u8],
+    index: usize,
+    cap: u64,
+) -> Result<TempBacked> {
+    // detect() already opened this archive format to build the Member plan, so
+    // open_with_format returns Some here; the guard fails loud if that breaks.
+    let Some(mut archive) = Archive::open_with_format(format, data)? else {
+        // cov:unreachable: Member plan implies an archive format
+        return Err(ArchiveError::Open {
+            format: "archive",
+            detail: "member plan produced for a non-archive format".to_string(),
+        });
+    };
+    spill(|out| archive.stream_member(index, out, cap))
+}
+
+/// Create a fresh temp file under [`std::env::temp_dir`], run `write_into` to fill
+/// it (capped), then rewind it to the start and return a [`TempBacked`] handle.
+/// The temp file is deleted if `write_into` fails (RAII on the local).
+fn spill(write_into: impl FnOnce(&mut dyn Write) -> Result<u64>) -> Result<TempBacked> {
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| ArchiveError::Read {
+        format: "temp-spill",
+        detail: e.to_string(),
+    })?;
+    let written = write_into(tmp.as_file_mut())?;
+    let file = tmp.as_file_mut();
+    file.flush().map_err(|e| ArchiveError::Read {
+        format: "temp-spill",
+        detail: e.to_string(),
+    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| ArchiveError::Read {
+            format: "temp-spill",
+            detail: e.to_string(),
+        })?;
+    Ok(TempBacked {
+        inner: tmp,
+        len: written,
+    })
+}
+
+/// Copy `reader` into `out` through a bounded buffer, capped at `cap`; fails loud
+/// with [`ArchiveError::TooLarge`] past it. Returns the bytes written.
+fn copy_capped(
+    reader: impl Read,
+    out: &mut dyn Write,
+    cap: u64,
+    format: &'static str,
+) -> Result<u64> {
+    let mut limited = reader.take(cap + 1);
+    let n = io::copy(&mut limited, out).map_err(|e| ArchiveError::Decode {
+        format,
+        detail: e.to_string(),
+    })?;
+    if n > cap {
+        return Err(ArchiveError::TooLarge { cap });
+    }
+    Ok(n)
+}
+
+/// A short, stable label for a codec (for diagnostics).
+fn codec_name(codec: Codec) -> &'static str {
+    match codec {
+        Codec::Gzip => "gzip",
+        Codec::Bzip2 => "bzip2",
+    }
 }
 
 /// Add a signed offset to a base position, failing on under/overflow.
@@ -437,5 +545,86 @@ mod tests {
             }
             other => panic!("expected Temp, got {other:?}"),
         }
+    }
+
+    // A bare bzip2 wrapper → SpillToTemp of the whole decompressed stream. Uses
+    // the committed payload.bz2 fixture (no in-tree bzip2 encoder) to exercise the
+    // bzip2 decoder arm of the wrapper spill.
+    #[test]
+    fn bare_bzip2_wrapper_spills_to_temp() {
+        let expected = "archive-detour bzip2 test payload — the quick brown fox\n"
+            .repeat(30)
+            .into_bytes();
+        match peel_archive_seekable(load("payload.bz2"), Some("payload.bz2"), &Limits::default())
+            .unwrap()
+        {
+            PeelSource::Inner(PeeledSource::Temp(mut t)) => {
+                let mut got = Vec::new();
+                t.read_to_end(&mut got).unwrap();
+                assert_eq!(got, expected);
+            }
+            other => panic!("expected Temp, got {other:?}"),
+        }
+    }
+
+    // Full Seek semantics on a SubRange window: End- and Current-relative seeks
+    // (both directions), clamping past the window edge, and a loud error on an
+    // out-of-range negative seek.
+    #[test]
+    fn subrange_seek_end_and_current() {
+        let data: Vec<u8> = (0u8..50).collect();
+        // Window bytes [10, 30) → values 10..30.
+        let mut sub = SubRange::new(data, 10, 20, u64::MAX).unwrap();
+        assert_eq!(sub.offset(), 10);
+        assert!(!sub.is_empty());
+
+        // End-relative.
+        assert_eq!(sub.seek(SeekFrom::End(-4)).unwrap(), 16);
+        let mut four = [0u8; 4];
+        sub.read_exact(&mut four).unwrap();
+        assert_eq!(four, [26, 27, 28, 29]);
+
+        // Current-relative, both directions.
+        assert_eq!(sub.seek(SeekFrom::Current(-4)).unwrap(), 16);
+        sub.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(sub.seek(SeekFrom::Current(5)).unwrap(), 5);
+
+        // Seeking past the window edge clamps to len.
+        assert_eq!(sub.seek(SeekFrom::Start(999)).unwrap(), 20);
+
+        // An out-of-range negative seek fails loud.
+        assert!(sub.seek(SeekFrom::Current(-999)).is_err());
+    }
+
+    // A window that overruns the source is rejected (a lying member offset/size
+    // is never trusted), and a zero-length window reports empty.
+    #[test]
+    fn subrange_rejects_overrun_and_reports_empty() {
+        let overrun = SubRange::new(vec![0u8; 10], 5, 20, u64::MAX);
+        assert!(matches!(overrun, Err(ArchiveError::Read { .. })));
+
+        let empty = SubRange::new(vec![0u8; 10], 4, 0, u64::MAX).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+    }
+
+    // The public trait-object surface: read and seek through `PeeledSource`
+    // itself (and a `Box<dyn ReadSeek>`), not the inner handle — this is how a
+    // consumer that erases the backing store uses the peel.
+    #[test]
+    fn peeled_source_reads_and_seeks_as_trait_object() {
+        let data = load("stored_one.zip");
+        let expected = member_oracle(&data, "stored_one.zip", "disk.dd");
+        let PeelSource::Inner(source) =
+            peel_archive_seekable(data, Some("stored_one.zip"), &Limits::default()).unwrap()
+        else {
+            panic!("expected an Inner source");
+        };
+        // Drive Read+Seek through the erased handle.
+        let mut handle: Box<dyn ReadSeek> = Box::new(source);
+        handle.seek(SeekFrom::Start(0)).unwrap();
+        let mut got = Vec::new();
+        handle.read_to_end(&mut got).unwrap();
+        assert_eq!(got, expected);
     }
 }

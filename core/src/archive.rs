@@ -164,6 +164,51 @@ impl Archive {
         }
     }
 
+    /// Stream the bytes of member `index` into `out`, capped at `cap`. The member
+    /// is copied through a bounded buffer — never fully materialized in a `Vec` —
+    /// so a multi-GB inner image spills to the caller's writer (a temp file)
+    /// without holding it in RAM. Fails loud with [`ArchiveError::TooLarge`] past
+    /// `cap`. Returns the number of bytes written.
+    ///
+    /// The one exception is a 7z member: `sevenz-rust2` exposes no streaming
+    /// extract, so its bytes pass through a transient `Vec` before the write.
+    ///
+    /// # Errors
+    /// [`ArchiveError::IndexOutOfRange`] for a bad index, [`ArchiveError::Read`]
+    /// on a backend/codec failure, or [`ArchiveError::TooLarge`] past `cap`.
+    pub fn stream_member(
+        &mut self,
+        index: usize,
+        out: &mut dyn std::io::Write,
+        cap: u64,
+    ) -> Result<u64> {
+        let count = self.entries.len();
+        if index >= count {
+            return Err(ArchiveError::IndexOutOfRange { index, count });
+        }
+        let (name, declared_size) = {
+            let e = &self.entries[index];
+            (e.name.clone(), e.size)
+        };
+        match &mut self.backend {
+            Backend::Tar { compressed, outer } => {
+                stream_tar_member(compressed, *outer, index, out, cap)
+            }
+            Backend::Zip { archive } => stream_zip_member(archive, index, out, cap),
+            Backend::SevenZip { reader } => {
+                let bytes = read_7z_member(reader, &name, declared_size)?;
+                if bytes.len() as u64 > cap {
+                    return Err(ArchiveError::TooLarge { cap });
+                }
+                out.write_all(&bytes).map_err(|e| ArchiveError::Read {
+                    format: "7z",
+                    detail: e.to_string(),
+                })?;
+                Ok(bytes.len() as u64)
+            }
+        }
+    }
+
     /// Build a tar [`Archive`] over the still-**compressed** `compressed` bytes,
     /// listing members by streaming a fresh decompressor. The `tar` crate skips
     /// each member's body *through* the decompressor, so no member data is
@@ -362,6 +407,69 @@ fn read_7z_member(
         return Err(ArchiveError::TooLarge { cap: MAX_INFLATED });
     }
     Ok(out)
+}
+
+/// Copy `reader` into `out` through a bounded buffer, capped at `cap`. Reads one
+/// byte past the cap so an over-cap stream is *detected*, not silently truncated;
+/// fails loud with [`ArchiveError::TooLarge`]. Returns the bytes written.
+fn copy_capped(
+    reader: impl std::io::Read,
+    out: &mut dyn std::io::Write,
+    cap: u64,
+    format: &'static str,
+) -> Result<u64> {
+    let mut limited = reader.take(cap + 1);
+    let n = std::io::copy(&mut limited, out).map_err(|e| ArchiveError::Read {
+        format,
+        detail: e.to_string(),
+    })?;
+    if n > cap {
+        return Err(ArchiveError::TooLarge { cap });
+    }
+    Ok(n)
+}
+
+/// Stream the `index`-th tar member into `out`, capped. Mirrors
+/// [`extract_tar_member_streaming`], writing to a sink instead of a `Vec` so the
+/// member never lands in RAM whole.
+fn stream_tar_member(
+    compressed: &[u8],
+    outer: Format,
+    index: usize,
+    out: &mut dyn std::io::Write,
+    cap: u64,
+) -> Result<u64> {
+    let mut ar = tar::Archive::new(tar_stream(compressed, outer));
+    let mut iter = ar.entries().map_err(|e| ArchiveError::Read {
+        format: "tar",
+        detail: e.to_string(),
+    })?;
+    let entry = iter
+        .nth(index)
+        .ok_or(ArchiveError::IndexOutOfRange {
+            index,
+            count: index,
+        })?
+        .map_err(|e| ArchiveError::Read {
+            format: "tar",
+            detail: e.to_string(),
+        })?;
+    copy_capped(entry, out, cap, "tar")
+}
+
+/// Stream the `index`-th ZIP member into `out`, capped. The fleet reader verifies
+/// CRC-32 at EOF and fails loud on mismatch.
+fn stream_zip_member(
+    archive: &mut zip_core::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    index: usize,
+    out: &mut dyn std::io::Write,
+    cap: u64,
+) -> Result<u64> {
+    let zf = archive.by_index(index).map_err(|e| ArchiveError::Read {
+        format: "zip",
+        detail: e.to_string(),
+    })?;
+    copy_capped(zf, out, cap, "zip")
 }
 
 #[cfg(test)]
