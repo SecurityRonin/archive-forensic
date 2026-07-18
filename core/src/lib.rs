@@ -23,6 +23,7 @@ mod error;
 mod execute;
 mod peel;
 mod plan;
+mod reassemble;
 mod resolve;
 
 pub use archive::{Archive, ArchiveEntry};
@@ -34,4 +35,5 @@ pub use execute::{
 };
 pub use peel::{peel_bytes, PeelOutcome};
 pub use plan::{detect, Access, AccessPlan, Codec, Segment, SegmentKind};
+pub use reassemble::{reassemble, segment_sources, ConcatSource, Reassembled, SegmentSources};
 pub use resolve::{resolve, Limits, Node};
