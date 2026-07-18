@@ -25,6 +25,8 @@ mod peel;
 mod plan;
 mod reassemble;
 mod resolve;
+#[cfg(feature = "vfs")]
+mod vfs;
 
 pub use archive::{Archive, ArchiveEntry};
 pub use archive_layer::{peel_archive, Peel};
@@ -37,3 +39,5 @@ pub use peel::{peel_bytes, PeelOutcome};
 pub use plan::{detect, Access, AccessPlan, Codec, Segment, SegmentKind};
 pub use reassemble::{reassemble, segment_sources, ConcatSource, Reassembled, SegmentSources};
 pub use resolve::{resolve, Limits, Node};
+#[cfg(feature = "vfs")]
+pub use vfs::ArchiveOpener;

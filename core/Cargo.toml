@@ -14,8 +14,17 @@ categories = ["compression", "filesystem", "parser-implementations"]
 [lib]
 name = "archive_core"
 
+[features]
+# Implement the forensic-vfs `ArchiveOpen` contract so the archive layer plugs
+# into the universal VFS resolver (see `src/vfs.rs`). Optional so a bare reader
+# stays dependency-light.
+vfs = ["dep:forensic-vfs"]
+
 [dependencies]
 thiserror.workspace = true
+# The forensic-vfs KNOWLEDGE leaf — the ArchiveOpen/ImageSource contract. Optional,
+# gated behind the `vfs` feature.
+forensic-vfs = { version = "0.4", optional = true }
 # Pure-Rust compression decoders (no C) for the tar.gz / tar.bz2 outer layer.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 bzip2-rs = "0.1"
