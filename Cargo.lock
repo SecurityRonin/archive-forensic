@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "archive-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bzip2-rs",
  "flate2",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "archive-forensic"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "archive-core",
  "thiserror",
