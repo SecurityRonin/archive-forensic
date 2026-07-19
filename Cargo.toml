@@ -10,7 +10,7 @@ repository = "https://github.com/SecurityRonin/archive-forensic"
 authors = ["Albert Hui <albert@securityronin.com>"]
 
 [workspace.dependencies]
-archive-core = { path = "core", version = "0.1.0" }
+archive-core = { path = "core", version = "0.1.2" }
 thiserror = "2"
 
 [workspace.lints.rust]
