@@ -4,7 +4,10 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.87"
+# The batteries-included reader depends on sevenz-rust2 (pure-Rust 7z), which
+# requires rustc 1.93 — that dependency sets the real MSRV floor. Capability
+# (7z decode) wins over a lower declared MSRV per fleet policy.
+rust-version = "1.93"
 license = "Apache-2.0"
 repository = "https://github.com/SecurityRonin/archive-forensic"
 authors = ["Albert Hui <albert@securityronin.com>"]
