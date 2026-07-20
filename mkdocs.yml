@@ -1,0 +1,30 @@
+site_name: archive-forensic
+site_url: https://securityronin.github.io/archive-forensic/
+repo_url: https://github.com/SecurityRonin/archive-forensic
+site_description: >-
+  Pure-Rust, forbid(unsafe) archive-layer reader and anomaly auditor for
+  forensics — transparently peels gzip/bzip2/xz/zip/7z/tar layers to reach the
+  inner evidence, with content-magic format detection.
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+
+nav:
+  - Home: index.md
+  - Validation: validation.md
+  - Privacy Policy: privacy.md
+  - Terms of Service: terms.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - pymdownx.superfences
+
+plugins:
+  - search
