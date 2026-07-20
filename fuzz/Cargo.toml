@@ -1,0 +1,32 @@
+[package]
+name = "archive-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+archive-core = { path = "../core" }
+
+[[bin]]
+name = "fuzz_peel"
+path = "fuzz_targets/fuzz_peel.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_resolve"
+path = "fuzz_targets/fuzz_resolve.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_archive"
+path = "fuzz_targets/fuzz_archive.rs"
+test = false
+doc = false
