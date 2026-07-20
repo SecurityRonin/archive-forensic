@@ -585,4 +585,214 @@ mod tests {
             .unwrap();
         assert_eq!(a.read(ia).unwrap(), b"alpha member contents\n");
     }
+
+    const FX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/data/fixtures/");
+
+    fn load(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{FX}{name}")).unwrap()
+    }
+
+    fn member_index(a: &Archive, name: &str) -> usize {
+        a.entries()
+            .iter()
+            .position(|e| e.name == name && !e.is_dir)
+            .unwrap_or_else(|| panic!("member {name} not found"))
+    }
+
+    // `stream_member` writes a tar member's bytes to a sink and returns the count,
+    // without ever materializing the whole decompressed tar.
+    #[test]
+    fn stream_member_tar_writes_bytes_and_count() {
+        let payload = vec![0xCD_u8; 700];
+        let tar = build_tar(&[("only.bin", payload.clone())]);
+        let mut a = Archive::open(&tar, Some("x.tar")).unwrap().unwrap();
+        let mut sink = Vec::new();
+        let n = a.stream_member(0, &mut sink, MAX_INFLATED).unwrap();
+        assert_eq!(n, payload.len() as u64);
+        assert_eq!(sink, payload);
+    }
+
+    // A tar member streamed under a cap smaller than its size fails loud via
+    // `copy_capped`'s over-cap guard (never a silent truncation).
+    #[test]
+    fn stream_member_tar_over_cap_fails_loud() {
+        let tar = build_tar(&[("big.bin", vec![0x7E_u8; 1000])]);
+        let mut a = Archive::open(&tar, Some("x.tar")).unwrap().unwrap();
+        let mut sink = Vec::new();
+        match a.stream_member(0, &mut sink, 100) {
+            Err(ArchiveError::TooLarge { cap }) => assert_eq!(cap, 100),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    // A bad index into `stream_member` fails loud before any backend dispatch.
+    #[test]
+    fn stream_member_out_of_range_fails_loud() {
+        let tar = build_tar(&[("only.bin", vec![0x33_u8; 10])]);
+        let mut a = Archive::open(&tar, Some("x.tar")).unwrap().unwrap();
+        let mut sink = Vec::new();
+        assert!(matches!(
+            a.stream_member(99, &mut sink, MAX_INFLATED),
+            Err(ArchiveError::IndexOutOfRange { .. })
+        ));
+    }
+
+    // The 7z streaming arm decodes a member and writes it through the transient
+    // `Vec` seam (sevenz-rust2 has no streaming extract), returning the count.
+    #[test]
+    fn stream_member_7z_writes_bytes() {
+        let data = load("payload.7z");
+        let mut a = Archive::open(&data, Some("payload.7z")).unwrap().unwrap();
+        let ia = member_index(&a, "a.txt");
+        let mut sink = Vec::new();
+        let n = a.stream_member(ia, &mut sink, MAX_INFLATED).unwrap();
+        assert_eq!(sink, b"alpha member contents\n");
+        assert_eq!(n, sink.len() as u64);
+    }
+
+    // A 7z member streamed under a cap smaller than the decoded size fails loud
+    // (the decoded-length check on the 7z arm).
+    #[test]
+    fn stream_member_7z_over_cap_fails_loud() {
+        let data = load("payload.7z");
+        let mut a = Archive::open(&data, Some("payload.7z")).unwrap().unwrap();
+        let ia = member_index(&a, "a.txt");
+        let mut sink = Vec::new();
+        match a.stream_member(ia, &mut sink, 3) {
+            Err(ArchiveError::TooLarge { cap }) => assert_eq!(cap, 3),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    // A ZIP member streams to the sink byte-for-byte via the fleet reader.
+    #[test]
+    fn stream_member_zip_writes_bytes() {
+        let data = load("payload.zip");
+        let mut a = Archive::open(&data, Some("payload.zip")).unwrap().unwrap();
+        let ia = member_index(&a, "a.txt");
+        let mut sink = Vec::new();
+        let n = a.stream_member(ia, &mut sink, MAX_INFLATED).unwrap();
+        assert_eq!(sink, b"alpha member contents\n");
+        assert_eq!(n, sink.len() as u64);
+    }
+
+    // A zip payload behind the `PK\x03\x04` magic that is not a valid archive
+    // fails loud with a byte-carrying Open error — never a silent empty listing.
+    #[test]
+    fn corrupt_zip_open_fails_loud() {
+        let mut bytes = b"PK\x03\x04".to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        match Archive::open(&bytes, Some("x.zip")) {
+            Err(ArchiveError::Open { format, .. }) => assert_eq!(format, "zip"),
+            Err(e) => panic!("expected a zip Open error, got a different error: {e:?}"),
+            Ok(_) => panic!("expected a loud zip Open error, got Ok"),
+        }
+    }
+
+    // 7z magic followed by garbage fails loud at open (the sevenz-rust2 header
+    // parse errors out), not a silent None.
+    #[test]
+    fn corrupt_7z_open_fails_loud() {
+        let mut bytes = vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+        bytes.extend_from_slice(&[0u8; 64]);
+        match Archive::open(&bytes, Some("x.7z")) {
+            Err(ArchiveError::Open { format, .. }) => assert_eq!(format, "7z"),
+            Err(e) => panic!("expected a 7z Open error, got a different error: {e:?}"),
+            Ok(_) => panic!("expected a loud 7z Open error, got Ok"),
+        }
+    }
+
+    // `member_access` classifies a Stored zip member as a zero-copy InPlace window
+    // and a Deflated member as a Zran seek index (ADR 0008 access ladder).
+    #[test]
+    fn member_access_classifies_zip_stored_and_deflated() {
+        let mut stored = Archive::open(&load("stored_one.zip"), Some("stored_one.zip"))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            stored.member_access(0).unwrap(),
+            Access::InPlace { .. }
+        ));
+        let mut deflated = Archive::open(&load("deflate_one.zip"), Some("deflate_one.zip"))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(deflated.member_access(0).unwrap(), Access::Zran));
+    }
+
+    /// A single-member STORED zip whose recorded CRC-32 is deliberately wrong, so
+    /// the fleet reader's EOF CRC check must reject it on extract.
+    fn stored_zip_bad_crc(name: &str, payload: &[u8]) -> Vec<u8> {
+        let nb = name.as_bytes();
+        let mut crc = flate2::Crc::new();
+        crc.update(payload);
+        let bad_crc = crc.sum() ^ 0xFFFF_FFFF; // guaranteed != the real CRC
+        let (sz, nlen) = (payload.len() as u32, nb.len() as u16);
+        let mut z = Vec::new();
+        // Local file header (method 0 = stored).
+        z.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        z.extend_from_slice(&0u16.to_le_bytes()); // flags
+        z.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        z.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        z.extend_from_slice(&bad_crc.to_le_bytes());
+        z.extend_from_slice(&sz.to_le_bytes()); // compressed size
+        z.extend_from_slice(&sz.to_le_bytes()); // uncompressed size
+        z.extend_from_slice(&nlen.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        z.extend_from_slice(nb);
+        z.extend_from_slice(payload);
+        let cd_offset = z.len() as u32;
+        // Central directory header.
+        let mut central = Vec::new();
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central.extend_from_slice(&0u16.to_le_bytes()); // flags
+        central.extend_from_slice(&0u16.to_le_bytes()); // method
+        central.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        central.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        central.extend_from_slice(&bad_crc.to_le_bytes());
+        central.extend_from_slice(&sz.to_le_bytes());
+        central.extend_from_slice(&sz.to_le_bytes());
+        central.extend_from_slice(&nlen.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        central.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        central.extend_from_slice(nb);
+        let cd_size = central.len() as u32;
+        z.extend_from_slice(&central);
+        // End of central directory.
+        z.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk num
+        z.extend_from_slice(&0u16.to_le_bytes()); // disk with cd
+        z.extend_from_slice(&1u16.to_le_bytes()); // entries this disk
+        z.extend_from_slice(&1u16.to_le_bytes()); // total entries
+        z.extend_from_slice(&cd_size.to_le_bytes());
+        z.extend_from_slice(&cd_offset.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        z
+    }
+
+    // A zip member with a wrong CRC-32 opens fine (the directory is intact) but
+    // must fail LOUD on extraction — both `read` and `stream_member` reject it via
+    // the fleet reader's EOF CRC check, never returning corrupt bytes silently.
+    #[test]
+    fn zip_member_bad_crc_fails_loud_on_read_and_stream() {
+        let data = stored_zip_bad_crc("blob.bin", b"corruption-detected-by-crc");
+        let mut a = Archive::open(&data, Some("x.zip")).unwrap().unwrap();
+        assert_eq!(a.entries().len(), 1);
+        match a.read(0) {
+            Err(ArchiveError::Read { format, .. }) => assert_eq!(format, "zip"),
+            other => panic!("expected a loud zip Read error on read, got {other:?}"),
+        }
+        let mut sink = Vec::new();
+        match a.stream_member(0, &mut sink, MAX_INFLATED) {
+            Err(ArchiveError::Read { format, .. }) => assert_eq!(format, "zip"),
+            other => panic!("expected a loud zip Read error on stream, got {other:?}"),
+        }
+    }
 }

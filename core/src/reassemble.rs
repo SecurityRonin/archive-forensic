@@ -446,4 +446,25 @@ mod tests {
         ));
         assert!(segment_sources(data, &Limits::default()).unwrap().is_none());
     }
+
+    // `SeekFrom::Current` moves the position relative to the cursor (forward and
+    // backward), and a subsequent read returns the bytes at the resulting offset.
+    #[test]
+    fn seek_from_current_is_relative_both_ways() {
+        let p1 = pattern(500, 0);
+        let p2 = pattern(500, 50);
+        let data = stored_zip(&[("s.001", &p1), ("s.002", &p2)]);
+        let Reassembled::Concat(mut c) = reassemble(data, &Limits::default()).unwrap() else {
+            panic!("expected a SplitRaw ConcatSource");
+        };
+        c.seek(SeekFrom::Start(100)).unwrap();
+        assert_eq!(c.seek(SeekFrom::Current(50)).unwrap(), 150);
+        let mut got = [0u8; 4];
+        c.read_exact(&mut got).unwrap();
+        assert_eq!(got, p1[150..154]);
+        // pos is now 154; a negative relative seek walks back into segment 1.
+        assert_eq!(c.seek(SeekFrom::Current(-54)).unwrap(), 100);
+        c.read_exact(&mut got).unwrap();
+        assert_eq!(got, p1[100..104]);
+    }
 }

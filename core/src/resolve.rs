@@ -197,3 +197,75 @@ fn strip_compression_ext(name: Option<&str>) -> Option<String> {
     }
     Some(name.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut e = GzEncoder::new(Vec::new(), Compression::fast());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// A `ustar` tar carrying one directory entry (`d/`) followed by one file
+    /// member (`d/f.txt`), so `resolve` sees both an `is_dir` entry and a leaf.
+    fn tar_dir_and_file() -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut hd = tar::Header::new_gnu();
+        hd.set_entry_type(tar::EntryType::Directory);
+        hd.set_size(0);
+        hd.set_mode(0o755);
+        hd.set_cksum();
+        b.append_data(&mut hd, "d/", std::io::empty()).unwrap();
+        let mut hf = tar::Header::new_gnu();
+        hf.set_size(5);
+        hf.set_mode(0o644);
+        hf.set_cksum();
+        b.append_data(&mut hf, "d/f.txt", &b"hello"[..]).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    // A directory entry inside an archive is recorded as a `Node::Dir`, and the
+    // file member alongside it resolves to a leaf with its exact bytes.
+    #[test]
+    fn resolve_records_directory_entries() {
+        let nodes = resolve(&tar_dir_and_file(), Some("x.tar"), &Limits::default()).unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|n| matches!(n, Node::Dir { name } if name == "d/")),
+            "the directory entry must be recorded, got {nodes:?}"
+        );
+        assert!(nodes.iter().any(
+            |n| matches!(n, Node::File { name, bytes } if name == "d/f.txt" && bytes == b"hello")
+        ));
+    }
+
+    // A bomb nested INSIDE an archive member (a 10-layer bare gzip, past the
+    // default depth-8 cap) must fail loud through the archive-member recursion —
+    // the error propagates up, never a silent partial result.
+    #[test]
+    fn nested_bomb_in_archive_member_propagates_error() {
+        let mut cur = b"deep".to_vec();
+        for _ in 0..10 {
+            cur = gzip(&cur);
+        }
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(cur.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, "bomb.gz", cur.as_slice()).unwrap();
+        let tar = b.into_inner().unwrap();
+
+        let err = resolve(&tar, Some("x.tar"), &Limits::default()).unwrap_err();
+        assert!(
+            format!("{err}").contains("depth"),
+            "expected a depth error propagated from the member, got: {err}"
+        );
+    }
+}

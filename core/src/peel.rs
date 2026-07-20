@@ -144,4 +144,31 @@ mod tests {
         let seven = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 0];
         assert_eq!(sniff(Some("foo.gz"), &seven), Format::SevenZip);
     }
+
+    // A gzip stream whose tail is truncated still sniffs as gzip (magic head
+    // intact) but must fail LOUD on inflate — never silently return a short body.
+    #[test]
+    fn truncated_gzip_fails_loud() {
+        let inner = b"disk sector bytes \x00\x01\x02 the quick brown fox".repeat(50);
+        let mut gz = gzip(&inner);
+        gz.truncate(gz.len() / 2); // lop off the compressed tail + CRC/ISIZE
+        assert_eq!(sniff(Some("disk.dd.gz"), &gz), Format::Gzip);
+        match peel_bytes(&gz, Some("disk.dd.gz")) {
+            Err(ArchiveError::Decode { format, .. }) => assert_eq!(format, "gzip"),
+            other => panic!("expected a loud gzip Decode error, got {other:?}"),
+        }
+    }
+
+    // The committed bzip2 fixture, truncated mid-stream, still carries the `BZh`
+    // magic (sniffs Bzip2) but must fail loud on decode.
+    #[test]
+    fn truncated_bzip2_fails_loud() {
+        let mut bz = PAYLOAD_BZ2.to_vec();
+        bz.truncate(bz.len() / 2);
+        assert_eq!(sniff(Some("payload.bz2"), &bz), Format::Bzip2);
+        match peel_bytes(&bz, Some("payload.bz2")) {
+            Err(ArchiveError::Decode { format, .. }) => assert_eq!(format, "bzip2"),
+            other => panic!("expected a loud bzip2 Decode error, got {other:?}"),
+        }
+    }
 }

@@ -104,10 +104,10 @@ jobs:
           tool: cargo-llvm-cov
       # A line-coverage FLOOR, not a 100% per-line gate: archive-core is under
       # active TDD build-out (codec coverage grows incrementally), so the honest
-      # achieved level (~89.7% lines) is the regression backstop. Ratchet the
-      # floor up as the remaining peel/reassembly paths gain tests.
+      # achieved level (~92.4% lines) is the regression backstop. Ratchet the
+      # floor up as the remaining archive error-injection paths gain tests.
       - name: Enforce workspace line-coverage floor
-        run: cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines 88
+        run: cargo llvm-cov --workspace --all-features --summary-only --fail-under-lines 92
       - name: Show missing lines (advisory)
         if: always()
         run: cargo llvm-cov --workspace --all-features --summary-only --show-missing-lines || true

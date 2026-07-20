@@ -326,4 +326,70 @@ mod tests {
             Ok(_) => panic!("expected a loud Decode error, got Ok"),
         }
     }
+
+    // probe() is magic-authoritative for every recognized codec — bzip2 (`BZh`)
+    // and a bare `ustar` tar (magic at offset 257) are both recognized name-blind.
+    #[test]
+    fn probe_recognizes_bzip2_and_tar_magic() {
+        let op = ArchiveOpener::new();
+        assert!(op
+            .probe(&SniffWindow::new(0, b"BZh91AY&SYnot-real"))
+            .is_yes());
+        let tar = build_tar(&[("a.bin", vec![1u8; 10])]);
+        assert!(
+            op.probe(&SniffWindow::new(0, &tar)).is_yes(),
+            "ustar magic at offset 257 must be recognized"
+        );
+    }
+
+    /// A `ustar` tar with a directory entry (`d/`) plus one file member
+    /// (`d/f.txt`), so the opener must skip the directory and keep only the file.
+    fn tar_dir_and_file() -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        let mut hd = tar::Header::new_gnu();
+        hd.set_entry_type(tar::EntryType::Directory);
+        hd.set_size(0);
+        hd.set_mode(0o755);
+        hd.set_cksum();
+        b.append_data(&mut hd, "d/", std::io::empty()).unwrap();
+        let mut hf = tar::Header::new_gnu();
+        hf.set_size(5);
+        hf.set_mode(0o644);
+        hf.set_cksum();
+        b.append_data(&mut hf, "d/f.txt", &b"hello"[..]).unwrap();
+        b.into_inner().unwrap()
+    }
+
+    // A directory entry has no byte source: the Members table carries only file
+    // members, mirroring resolve()/peel_archive's !is_dir filter.
+    #[test]
+    fn open_tar_skips_directory_members() {
+        match ArchiveOpener::new()
+            .open(source(tar_dir_and_file()))
+            .unwrap()
+        {
+            ArchiveContents::Members(members) => {
+                assert_eq!(members.len(), 1, "only the file member survives");
+                assert_eq!(members[0].name, b"d/f.txt");
+                assert_eq!(drain(&members[0].source), b"hello");
+            }
+            _ => panic!("a tar is a Members table, not a Stream"),
+        }
+    }
+
+    // A corrupt archive (zip magic + garbage) surfaces as a loud, byte-carrying
+    // Decode error from the archive-core open failure — never a silent success.
+    #[test]
+    fn open_corrupt_archive_fails_loud_with_bytes() {
+        let mut bytes = b"PK\x03\x04".to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        match ArchiveOpener::new().open(source(bytes)) {
+            Err(VfsError::Decode { layer, bytes, .. }) => {
+                assert_eq!(layer, "archive");
+                assert!(!bytes.is_empty(), "the offending head bytes are attached");
+            }
+            Err(e) => panic!("expected a Decode error, got a different VfsError: {e}"),
+            Ok(_) => panic!("expected a loud Decode error, got Ok"),
+        }
+    }
 }
