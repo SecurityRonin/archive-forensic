@@ -1,6 +1,8 @@
 #![no_main]
-//! `peel_bytes` removes one archive/compression layer from attacker-controllable
-//! bytes (gzip/bzip2/xz/zip/7z/tar). Peeling arbitrary bytes must NEVER panic.
+//! `peel_bytes` peels one BARE compression layer — **gzip/bzip2 only** — from
+//! attacker-controllable bytes. Everything else returns `NotPacked`: xz is not
+//! supported, and the zip/7z/tar member-list archives are handled by
+//! `crate::archive`, not here. Peeling arbitrary bytes must NEVER panic.
 
 use archive_core::peel_bytes;
 use libfuzzer_sys::fuzz_target;
