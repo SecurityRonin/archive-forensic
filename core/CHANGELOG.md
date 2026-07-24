@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.3...archive-core-v0.1.4) - 2026-07-24
+
+### Documentation
+
+- reverse-write PRD + ADRs; mkdocs excludes governance docs (fleet standard)
+- *(readme)* bring README to fleet badge + footer standard
+
 ## [0.1.2](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.1...archive-core-v0.1.2) - 2026-07-19
 
 ### Fixed
