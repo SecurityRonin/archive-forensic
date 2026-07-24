@@ -21,24 +21,24 @@
 //! ## The EWF `SegmentBacking` seam
 //!
 //! The `ewf` crate accepts explicit segment backings through
-//! `EwfReader::open_from_sources(Vec<ewf::SegmentSource>)`, where
-//! `ewf::SegmentSource` is a closed enum of `File` (a loose segment file), `Sub`
-//! (a `[base, base+len)` sub-range of a shared **on-disk** `File`), and `Mem`
-//! (an in-RAM `Arc<[u8]>`). archive-core's [`PeeledSource`]s are in-RAM
+//! `EwfReader::open_from_sources(Vec<ewf::SegmentSource>)`. `ewf::SegmentSource`
+//! has four variants: `File` (a loose segment file), `Sub` (a `[base, base+len)`
+//! sub-range of a shared **on-disk** `File`), `Mem` (an in-RAM `Arc<[u8]>`), and
+//! `Backing(Arc<dyn SegmentBacking>)` — an arbitrary boxed positioned reader
+//! (`read_at` + `len`). archive-core's [`PeeledSource`]s are in-RAM
 //! `Read + Seek` handles (a zero-copy [`SubRange`](crate::SubRange) window, a
-//! zran checkpoint index, or a temp spill) — not `File`s — so the only lossless
-//! adapter available today is materializing each segment to an `Arc<[u8]>` and
-//! handing `ewf::SegmentSource::Mem`, which defeats the zero-spill zran path for
-//! a Deflate-compressed E01-in-zip set.
+//! zran checkpoint index, or a temp spill) — not `File`s — but they need not be
+//! flattened to an `Arc<[u8]>`: a `PeeledSource` wrapped in a `SegmentBacking`
+//! impl feeds `ewf::SegmentSource::Backing` directly, preserving the zero-spill
+//! zran path for a Deflate-compressed E01-in-zip set (no full inflate, no `Mem`
+//! materialization).
 //!
-//! A *clean*, zero-copy wiring therefore needs an `ewf`-side change: a
-//! `SegmentSource` variant that accepts an arbitrary boxed positioned reader
-//! (`read_at` + `len`), so a zran-backed or windowed source flows in without a
-//! full inflate. That is a cross-repo change to `ewf`; per the phase plan
-//! archive-core STOPS at exposing the ordered [`PeeledSource`]s here, and the
-//! adapter into a container reader lives in the consumer (disk-forensic /
-//! forensic-vfs-engine), never inside this leaf (which would invert the layer
-//! direction — the archive layer must not depend on a CONTAINER crate).
+//! No `ewf`-side change is required — the `Backing` variant already ships. Per
+//! the phase plan archive-core STOPS at exposing the ordered [`PeeledSource`]s
+//! here; the adapter that wraps one in `ewf::SegmentSource::Backing` lives in the
+//! consumer (disk-forensic / forensic-vfs-engine), never inside this leaf (which
+//! would invert the layer direction — the archive layer must not depend on a
+//! CONTAINER crate).
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::Arc;
