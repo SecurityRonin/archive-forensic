@@ -8,6 +8,34 @@ user-id = 696
 user-login = "fitzgen"
 user-name = "Nick Fitzgerald"
 
+[[publisher.forensic-vfs]]
+version = "0.7.0"
+when = "2026-07-20"
+user-id = 347968
+user-login = "h4x0r"
+user-name = "Albert Hui"
+
+[[publisher.forensicnomicon-core]]
+version = "1.4.0"
+when = "2026-07-19"
+user-id = 347968
+user-login = "h4x0r"
+user-name = "Albert Hui"
+
+[[publisher.state-history-forensic]]
+version = "0.1.0"
+when = "2026-06-16"
+user-id = 347968
+user-login = "h4x0r"
+user-name = "Albert Hui"
+
+[[publisher.zip-forensic-core]]
+version = "0.2.0"
+when = "2026-07-01"
+user-id = 347968
+user-login = "h4x0r"
+user-name = "Albert Hui"
+
 [[audits.bytecode-alliance.wildcard-audits.bumpalo]]
 who = "Nick Fitzgerald <fitzgen@gmail.com>"
 criteria = "safe-to-deploy"
