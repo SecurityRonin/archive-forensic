@@ -203,8 +203,11 @@ version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.lzma-rust2]]
-version = "0.16.5"
+version = "0.18.0"
 criteria = "safe-to-deploy"
+notes = """
+Third-party, outrunning the audits (ADR-0018 mechanism 4). Reached only through sevenz-rust2 and pulled forward by that bump; 0.16.5 was exempted here on the same basis.
+"""
 
 [[exemptions.once_cell]]
 version = "1.21.4"
@@ -226,10 +229,6 @@ criteria = "safe-to-deploy"
 version = "1.0.107"
 criteria = "safe-to-deploy"
 
-[[exemptions.quote]]
-version = "1.0.47"
-criteria = "safe-to-deploy"
-
 [[exemptions.r-efi]]
 version = "6.0.0"
 criteria = "safe-to-deploy"
@@ -247,8 +246,11 @@ version = "0.8.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.sevenz-rust2]]
-version = "0.21.3"
+version = "0.21.4"
 criteria = "safe-to-deploy"
+notes = """
+Third-party, outrunning the audits (ADR-0018 mechanism 4), and exempted at 0.21.3 on the same basis before this bump. No imported aggregate audit set vouches for the publisher, so mechanism 3 does not apply. 0.21.4 is taken specifically because 0.21.3 panicked on a fuzz-found 7z header ("attempt to add with overflow", reader.rs:1047); core/tests/fuzz_regression.rs pins that.
+"""
 
 [[exemptions.sha1]]
 version = "0.10.7"
