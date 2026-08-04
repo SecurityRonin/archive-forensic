@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.4...archive-core-v0.1.5) - 2026-08-04
+
+### Fixed
+
+- *(deps)* take sevenz-rust2 0.21.4, which fixes a fuzz-found header panic
+
 ## [0.1.4](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.3...archive-core-v0.1.4) - 2026-07-24
 
 ### Documentation
