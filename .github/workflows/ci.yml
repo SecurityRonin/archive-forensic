@@ -19,3 +19,21 @@ jobs:
   # a behaviour change smuggled in by an adoption PR, so there is nothing here.
   ci:
     uses: SecurityRonin/fleet-ci/.github/workflows/rust-ci.yml@a62ab10603151071744cec0b4e3638aa6406d4e4
+    with:
+      # CARRIED ACROSS UNCHANGED. This repo did NOT enforce a 100% per-line gate —
+      # it enforced an aggregate 92% line floor, deliberately and with a written
+      # rationale: the residual uncovered lines are panic-free defensive guards and
+      # env-gated paths that only a real snapshot-bearing / deep-B-tree /
+      # corrupt-superblock image reaches, and annotating reachable code
+      # `// cov:unreachable` would be dishonest.
+      #
+      # Inheriting the fleet's strict gate here would have been a behaviour change
+      # smuggled in by an adoption PR — it fails on 11 defensive arms that the
+      # previous gate deliberately tolerated. Adoption carries the decision over;
+      # tightening it is a separate change that has to argue for itself.
+      #
+      # REMOVE WHEN: those paths are reachable by committed fixtures, or the
+      # provably-dead arms carry `// cov:unreachable: <invariant>` and this repo
+      # can inherit `coverage-gate: strict`.
+      coverage-gate: floor
+      coverage-floor: 92
