@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.5...archive-core-v0.1.6) - 2026-08-07
+
+### Fixed
+
+- *(docs)* point three intra-doc links at paths that actually resolve
+
 ## [0.1.5](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.4...archive-core-v0.1.5) - 2026-08-04
 
 ### Fixed
