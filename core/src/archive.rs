@@ -62,7 +62,7 @@ impl Archive {
     /// [`ArchiveError::Open`] if the archive directory cannot be parsed (a
     /// malformed outer compression layer surfaces here while streaming the tar
     /// listing). The tar family is listed by streaming, so no whole-archive
-    /// inflate happens at open; the [`crate::peel::MAX_INFLATED`] cap is enforced
+    /// inflate happens at open; the `MAX_INFLATED` cap (crate-private) is enforced
     /// per member in [`read`](Archive::read).
     pub fn open(data: &[u8], name: Option<&str>) -> Result<Option<Archive>> {
         Self::open_with_format(sniff(name, data), data)
@@ -139,7 +139,7 @@ impl Archive {
     }
 
     /// Extract the bytes of the member at `index`, capped at
-    /// [`crate::peel::MAX_INFLATED`].
+    /// `MAX_INFLATED` (crate-private).
     ///
     /// # Errors
     /// [`ArchiveError::IndexOutOfRange`] for a bad index, [`ArchiveError::Read`]

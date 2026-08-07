@@ -25,7 +25,7 @@ pub enum PeelOutcome {
 
 /// Peel one outer BARE gzip/bzip2 compression layer from `data`. Archives
 /// (`.tgz`/`.tbz2`/`.zip`/`.7z`) are NOT peeled here — they are member lists;
-/// use [`crate::archive::open`]. `name` is an optional file-name hint.
+/// use [`crate::Archive::open`]. `name` is an optional file-name hint.
 pub fn peel_bytes(data: &[u8], name: Option<&str>) -> Result<PeelOutcome> {
     match sniff(name, data) {
         Format::Gzip => Ok(PeelOutcome::Peeled {
