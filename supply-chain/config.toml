@@ -43,6 +43,11 @@ version = "0.12.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.block-padding]]
+version = "0.3.3"
+criteria = "safe-to-deploy"
+notes = "Shipped: a second version, pulled in by cbc 0.1.2 via zip-forensic-core 0.2.3 (see cbc). Not reviewed; added 2026-11-11."
+
+[[exemptions.block-padding]]
 version = "0.4.2"
 criteria = "safe-to-deploy"
 
@@ -53,6 +58,11 @@ criteria = "safe-to-deploy"
 [[exemptions.bzip2-rs]]
 version = "0.1.2"
 criteria = "safe-to-deploy"
+
+[[exemptions.cbc]]
+version = "0.1.2"
+criteria = "safe-to-deploy"
+notes = "Shipped: a second version, from zip-forensic-core 0.2.3 (our reader; its encryption support), the floor that clears RUSTSEC-2026-0344. Not reviewed; added 2026-11-11."
 
 [[exemptions.cbc]]
 version = "0.2.1"
@@ -234,7 +244,7 @@ version = "1.0.23"
 criteria = "safe-to-deploy"
 
 [[exemptions.ruzstd]]
-version = "0.8.3"
+version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.sevenz-rust2]]

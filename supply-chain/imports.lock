@@ -30,8 +30,8 @@ user-login = "h4x0r"
 user-name = "Albert Hui"
 
 [[publisher.zip-forensic-core]]
-version = "0.2.0"
-when = "2026-07-01"
+version = "0.2.3"
+when = "2026-11-04"
 user-id = 347968
 user-login = "h4x0r"
 user-name = "Albert Hui"
