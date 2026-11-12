@@ -22,6 +22,13 @@ user-id = 347968
 user-login = "h4x0r"
 user-name = "Albert Hui"
 
+[[publisher.rustix]]
+version = "1.1.6"
+when = "2026-10-27"
+user-id = 6825
+user-login = "sunfishcode"
+user-name = "Dan Gohman"
+
 [[publisher.state-history-forensic]]
 version = "0.2.2"
 when = "2026-08-26"
