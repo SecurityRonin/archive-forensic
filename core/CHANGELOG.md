@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.6...archive-core-v0.2.0) - 2026-11-11
+
+### Fixed
+
+- *(security)* require zip-forensic-core >= 0.2.3, clearing RUSTSEC-2026-0344
+- *(vfs)* [**breaking**] implement forensic-vfs 0.10, the trait the engine links against
+
 ## [0.1.6](https://github.com/SecurityRonin/archive-forensic/compare/archive-core-v0.1.5...archive-core-v0.1.6) - 2026-08-07
 
 ### Fixed
